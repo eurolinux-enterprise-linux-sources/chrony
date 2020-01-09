@@ -2,7 +2,7 @@
 
 Name:           chrony
 Version:        2.1.1
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        An NTP client/server
 
 Group:          System Environment/Daemons
@@ -22,6 +22,8 @@ Source8:        chrony.dhclient
 Source10:       https://github.com/mlichvar/clknetsim/archive/%{clknetsim_ver}/clknetsim-%{clknetsim_ver}.tar.gz
 %{?gitpatch:Patch0: chrony-%{version}-%{gitpatch}.patch.gz}
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
+
+Patch1:         chrony-smoothleap.patch
 
 BuildRequires:  libcap-devel libedit-devel nss-devel bison texinfo
 
@@ -46,6 +48,7 @@ clocks, system real-time clock or manual input as time references.
 %setup -q -n %{name}-%{version}%{?prerelease} -a 10
 mkdir pps; cp -p %{SOURCE6} pps
 %{?gitpatch:%patch0 -p1}
+%patch1 -p1 -b .smoothleap
 
 %{?gitpatch: echo %{version}-%{gitpatch} > version.txt}
 
@@ -157,6 +160,9 @@ fi
 %dir %attr(-,chrony,chrony) %{_localstatedir}/log/chrony
 
 %changelog
+* Mon Dec 05 2016 Miroslav Lichvar <mlichvar@redhat.com> 2.1.1-2
+- fix crash with smoothtime leaponly directive (#1392797)
+
 * Mon Nov 16 2015 Miroslav Lichvar <mlichvar@redhat.com> 2.1.1-1
 - update to 2.1.1
 - don't start chronyd if ntpd is running

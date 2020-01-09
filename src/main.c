@@ -4,7 +4,7 @@
  **********************************************************************
  * Copyright (C) Richard P. Curnow  1997-2003
  * Copyright (C) John G. Hasler  2009
- * Copyright (C) Miroslav Lichvar  2012-2014
+ * Copyright (C) Miroslav Lichvar  2012-2016
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -35,6 +35,7 @@
 #include "local.h"
 #include "sys.h"
 #include "ntp_io.h"
+#include "ntp_signd.h"
 #include "ntp_sources.h"
 #include "ntp_core.h"
 #include "sources.h"
@@ -49,8 +50,10 @@
 #include "refclock.h"
 #include "clientlog.h"
 #include "nameserv.h"
+#include "privops.h"
 #include "smooth.h"
 #include "tempcomp.h"
+#include "util.h"
 
 /* ================================================== */
 
@@ -64,6 +67,18 @@ static int exit_status = 0;
 static int reload = 0;
 
 static REF_Mode ref_mode = REF_ModeNormal;
+
+/* ================================================== */
+
+static void
+do_platform_checks(void)
+{
+  /* Require at least 32-bit integers, two's complement representation and
+     the usual implementation of conversion of unsigned integers */
+  assert(sizeof (int) >= 4);
+  assert(-1 == ~0);
+  assert((int32_t)4294967295U == (int32_t)-1);
+}
 
 /* ================================================== */
 
@@ -93,11 +108,12 @@ MAI_CleanupAndExit(void)
   TMC_Finalise();
   MNL_Finalise();
   CLG_Finalise();
+  NSD_Finalise();
   NSR_Finalise();
-  NCR_Finalise();
-  CAM_Finalise();
-  NIO_Finalise();
   SST_Finalise();
+  NCR_Finalise();
+  NIO_Finalise();
+  CAM_Finalise();
   KEY_Finalise();
   RCL_Finalise();
   SRC_Finalise();
@@ -106,6 +122,7 @@ MAI_CleanupAndExit(void)
   SYS_Finalise();
   SCH_Finalise();
   LCL_Finalise();
+  PRV_Finalise();
 
   delete_pidfile();
   
@@ -129,6 +146,16 @@ signal_cleanup(int x)
 /* ================================================== */
 
 static void
+quit_timeout(void *arg)
+{
+  /* Return with non-zero status if the clock is not synchronised */
+  exit_status = REF_GetOurStratum() >= NTP_MAX_STRATUM;
+  SCH_QuitProgram();
+}
+
+/* ================================================== */
+
+static void
 ntp_source_resolving_end(void)
 {
   NSR_SetSourceResolvingEndHandler(NULL);
@@ -141,6 +168,7 @@ ntp_source_resolving_end(void)
     SRC_ReloadSources();
   }
 
+  SRC_RemoveDumpFiles();
   RTC_StartMeasurements();
   RCL_StartRefclocks();
   NSR_StartSources();
@@ -264,7 +292,7 @@ write_lockfile(void)
   if (!out) {
     LOG_FATAL(LOGF_Main, "could not open lockfile %s for writing", pidfile);
   } else {
-    fprintf(out, "%d\n", getpid());
+    fprintf(out, "%d\n", (int)getpid());
     fclose(out);
   }
 }
@@ -274,24 +302,19 @@ write_lockfile(void)
 static void
 go_daemon(void)
 {
-#ifdef WINNT
-
-
-#else
-
   int pid, fd, pipefd[2];
 
   /* Create pipe which will the daemon use to notify the grandparent
      when it's initialised or send an error message */
   if (pipe(pipefd)) {
-    LOG_FATAL(LOGF_Logging, "Could not detach, pipe failed : %s", strerror(errno));
+    LOG_FATAL(LOGF_Main, "Could not detach, pipe failed : %s", strerror(errno));
   }
 
   /* Does this preserve existing signal handlers? */
   pid = fork();
 
   if (pid < 0) {
-    LOG_FATAL(LOGF_Logging, "Could not detach, fork failed : %s", strerror(errno));
+    LOG_FATAL(LOGF_Main, "Could not detach, fork failed : %s", strerror(errno));
   } else if (pid > 0) {
     /* In the 'grandparent' */
     char message[1024];
@@ -302,7 +325,8 @@ go_daemon(void)
     if (r) {
       if (r > 0) {
         /* Print the error message from the child */
-        fprintf(stderr, "%.1024s\n", message);
+        message[sizeof (message) - 1] = '\0';
+        fprintf(stderr, "%s\n", message);
       }
       exit(1);
     } else
@@ -316,7 +340,7 @@ go_daemon(void)
     pid = fork();
 
     if (pid < 0) {
-      LOG_FATAL(LOGF_Logging, "Could not detach, fork failed : %s", strerror(errno));
+      LOG_FATAL(LOGF_Main, "Could not detach, fork failed : %s", strerror(errno));
     } else if (pid > 0) {
       exit(0); /* In the 'parent' */
     } else {
@@ -324,7 +348,7 @@ go_daemon(void)
 
       /* Change current directory to / */
       if (chdir("/") < 0) {
-        LOG_FATAL(LOGF_Logging, "Could not chdir to / : %s", strerror(errno));
+        LOG_FATAL(LOGF_Main, "Could not chdir to / : %s", strerror(errno));
       }
 
       /* Don't keep stdin/out/err from before. But don't close
@@ -337,8 +361,6 @@ go_daemon(void)
       LOG_SetParentFd(pipefd[1]);
     }
   }
-
-#endif
 }
 
 /* ================================================== */
@@ -349,12 +371,15 @@ int main
   const char *conf_file = DEFAULT_CONF_FILE;
   const char *progname = argv[0];
   char *user = NULL;
+  struct passwd *pw;
   int debug = 0, nofork = 0, address_family = IPADDR_UNSPEC;
-  int do_init_rtc = 0, restarted = 0;
+  int do_init_rtc = 0, restarted = 0, timeout = 0;
   int other_pid;
-  int lock_memory = 0, sched_priority = 0;
+  int scfilter_level = 0, lock_memory = 0, sched_priority = 0;
   int system_log = 1;
   int config_args = 0;
+
+  do_platform_checks();
 
   LOG_Initialise();
 
@@ -382,6 +407,10 @@ int main
       } else {
         user = *argv;
       }
+    } else if (!strcmp("-F", *argv)) {
+      ++argv, --argc;
+      if (argc == 0 || sscanf(*argv, "%d", &scfilter_level) != 1)
+        LOG_FATAL(LOGF_Main, "Bad syscall filter level");
     } else if (!strcmp("-s", *argv)) {
       do_init_rtc = 1;
     } else if (!strcmp("-v", *argv) || !strcmp("--version",*argv)) {
@@ -402,12 +431,16 @@ int main
       ref_mode = REF_ModePrintOnce;
       nofork = 1;
       system_log = 0;
+    } else if (!strcmp("-t", *argv)) {
+      ++argv, --argc;
+      if (argc == 0 || sscanf(*argv, "%d", &timeout) != 1 || timeout <= 0)
+        LOG_FATAL(LOGF_Main, "Bad timeout");
     } else if (!strcmp("-4", *argv)) {
       address_family = IPADDR_INET4;
     } else if (!strcmp("-6", *argv)) {
       address_family = IPADDR_INET6;
     } else if (!strcmp("-h", *argv) || !strcmp("--help", *argv)) {
-      printf("Usage: %s [-4|-6] [-n|-d] [-q|-Q] [-r] [-R] [-s] [-f FILE|COMMAND...]\n",
+      printf("Usage: %s [-4|-6] [-n|-d] [-q|-Q] [-r] [-R] [-s] [-t TIMEOUT] [-f FILE|COMMAND...]\n",
              progname);
       return 0;
     } else if (*argv[0] == '-') {
@@ -464,6 +497,7 @@ int main
    * be done *AFTER* the daemon-creation fork() */
   write_lockfile();
 
+  PRV_Initialise();
   LCL_Initialise();
   SCH_Initialise();
   SYS_Initialise();
@@ -471,6 +505,12 @@ int main
   SRC_Initialise();
   RCL_Initialise();
   KEY_Initialise();
+
+  /* Open privileged ports before dropping root */
+  CAM_Initialise(address_family);
+  NIO_Initialise(address_family);
+  NCR_Initialise();
+  CNF_SetupAccessRestrictions();
 
   /* Command-line switch must have priority */
   if (!sched_priority) {
@@ -487,18 +527,21 @@ int main
   if (!user) {
     user = CNF_GetUser();
   }
-  if (user && strcmp(user, "root")) {
-    SYS_DropRoot(user);
-  }
 
-  LOG_CreateLogFileDir();
+  if ((pw = getpwnam(user)) == NULL)
+    LOG_FATAL(LOGF_Main, "Could not get %s uid/gid", user);
+
+  /* Create all directories before dropping root */
+  CNF_CreateDirs(pw->pw_uid, pw->pw_gid);
+
+  /* Drop root privileges if the user has non-zero uid or gid */
+  if (pw->pw_uid || pw->pw_gid)
+    SYS_DropRoot(pw->pw_uid, pw->pw_gid);
 
   REF_Initialise();
   SST_Initialise();
-  NIO_Initialise(address_family);
-  CAM_Initialise(address_family);
-  NCR_Initialise();
   NSR_Initialise();
+  NSD_Initialise();
   CLG_Initialise();
   MNL_Initialise();
   TMC_Initialise();
@@ -507,7 +550,12 @@ int main
   /* From now on, it is safe to do finalisation on exit */
   initialised = 1;
 
-  CNF_SetupAccessRestrictions();
+  UTI_SetQuitSignalsHandler(signal_cleanup);
+
+  CAM_OpenUnixSocket();
+
+  if (scfilter_level)
+    SYS_EnableSystemCallFilter(scfilter_level);
 
   if (ref_mode == REF_ModeNormal && CNF_GetInitSources() > 0) {
     ref_mode = REF_ModeInitStepSlew;
@@ -516,18 +564,14 @@ int main
   REF_SetModeEndHandler(reference_mode_end);
   REF_SetMode(ref_mode);
 
+  if (timeout)
+    SCH_AddTimeoutByDelay(timeout, quit_timeout, NULL);
+
   if (do_init_rtc) {
     RTC_TimeInit(post_init_rtc_hook, NULL);
   } else {
     post_init_rtc_hook(NULL);
   }
-
-  signal(SIGINT, signal_cleanup);
-  signal(SIGTERM, signal_cleanup);
-#if !defined(WINNT)
-  signal(SIGQUIT, signal_cleanup);
-  signal(SIGHUP, signal_cleanup);
-#endif /* WINNT */
 
   /* The program normally runs under control of the main loop in
      the scheduler. */

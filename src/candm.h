@@ -31,7 +31,6 @@
 
 #include "sysincl.h"
 #include "addressing.h"
-#include "hash.h"
 
 /* This is the default port to use for CANDM, if no alternative is
    defined */
@@ -91,18 +90,21 @@
 #define REQ_MODIFY_MAKESTEP 50
 #define REQ_SMOOTHING 51
 #define REQ_SMOOTHTIME 52
-#define N_REQUEST_TYPES 53
+#define REQ_REFRESH 53
+#define REQ_SERVER_STATS 54
+#define REQ_CLIENT_ACCESSES_BY_INDEX2 55
+#define REQ_LOCAL2 56
+#define REQ_NTP_DATA 57
+#define REQ_ADD_SERVER2 58
+#define REQ_ADD_PEER2 59
+#define N_REQUEST_TYPES 60
 
-/* Special utoken value used to log on with first exchange being the
-   password.  (This time value has long since gone by) */
-#define SPECIAL_UTOKEN 0x10101010
-
-/* Structure used to exchange timevals independent on size of time_t */
+/* Structure used to exchange timespecs independent of time_t size */
 typedef struct {
   uint32_t tv_sec_high;
   uint32_t tv_sec_low;
   uint32_t tv_nsec;
-} Timeval;
+} Timespec;
 
 /* This is used in tv_sec_high for 32-bit timestamps */
 #define TV_NOHIGHSEC 0x7fffffff
@@ -201,18 +203,20 @@ typedef struct {
 } REQ_Modify_Makestep;
 
 typedef struct {
-  Timeval ts;
+  Timespec ts;
   int32_t EOR;
 } REQ_Logon;
 
 typedef struct {
-  Timeval ts;
+  Timespec ts;
   int32_t EOR;
 } REQ_Settime;
 
 typedef struct {
   int32_t on_off;
   int32_t stratum;
+  Float distance;
+  int32_t orphan;
   int32_t EOR;
 } REQ_Local;
 
@@ -243,6 +247,9 @@ typedef struct {
 #define REQ_ADDSRC_IBURST 0x4
 #define REQ_ADDSRC_PREFER 0x8
 #define REQ_ADDSRC_NOSELECT 0x10
+#define REQ_ADDSRC_TRUST 0x20
+#define REQ_ADDSRC_REQUIRE 0x40
+#define REQ_ADDSRC_INTERLEAVED 0x80
 
 typedef struct {
   IPAddr ip_addr;
@@ -250,9 +257,17 @@ typedef struct {
   int32_t minpoll;
   int32_t maxpoll;
   int32_t presend_minpoll;
+  uint32_t min_stratum;
+  uint32_t poll_target;
+  uint32_t version;
+  uint32_t max_sources;
+  int32_t min_samples;
+  int32_t max_samples;
   uint32_t authkey;
   Float max_delay;
   Float max_delay_ratio;
+  Float max_delay_dev_ratio;
+  Float offset;
   uint32_t flags;
   int32_t EOR;
 } REQ_NTP_Source;
@@ -284,7 +299,7 @@ typedef struct {
 
 typedef struct {
   uint32_t first_index;
-  uint32_t n_indices;
+  uint32_t n_clients;
   int32_t EOR;
 } REQ_ClientAccessesByIndex;
 
@@ -305,6 +320,11 @@ typedef struct {
   int32_t option;
   int32_t EOR;
 } REQ_SmoothTime;
+
+typedef struct {
+  IPAddr ip_addr;
+  int32_t EOR;
+} REQ_NTPData;
 
 /* ================================================== */
 
@@ -335,7 +355,15 @@ typedef struct {
 
    Version 6 : added padding to requests to prevent amplification attack,
    changed maximum number of samples in manual list to 16, new commands: modify
-   makestep, smoothing report, smoothtime command
+   makestep, smoothing, smoothtime
+
+   Support for authentication was removed later in version 6 of the protocol
+   and commands that required authentication are allowed only locally over Unix
+   domain socket.
+
+   Version 6 (no authentication) : changed format of client accesses by index
+   (using new request/reply types), new fields and flags in NTP source request
+   and report, new commands: ntpdata, refresh, serverstats
  */
 
 #define PROTO_VERSION_NUMBER 6
@@ -349,7 +377,7 @@ typedef struct {
 #define PROTO_VERSION_PADDING 6
 
 /* The maximum length of padding in request packet, currently
-   defined by CLIENT_ACCESSES_BY_INDEX and MANUAL_LIST */
+   defined by MANUAL_LIST */
 #define MAX_PADDING_LENGTH 396
 
 /* ================================================== */
@@ -364,8 +392,8 @@ typedef struct {
                              (count up from zero for same sequence
                              number) */
   uint32_t sequence; /* Client's sequence number */
-  uint32_t utoken; /* Unique token per incarnation of daemon */
-  uint32_t token; /* Command token (to prevent replay attack) */
+  uint32_t pad1;
+  uint32_t pad2;
 
   union {
     REQ_Null null;
@@ -398,16 +426,12 @@ typedef struct {
     REQ_ManualDelete manual_delete;
     REQ_ReselectDistance reselect_distance;
     REQ_SmoothTime smoothtime;
+    REQ_NTPData ntp_data;
   } data; /* Command specific parameters */
 
-  /* The following fields only set the maximum size of the packet.
-     There are no holes between them and the actual data. */
-
-  /* Padding used to prevent traffic amplification */
+  /* Padding used to prevent traffic amplification.  It only defines the
+     maximum size of the packet, there is no hole after the data field. */
   uint8_t padding[MAX_PADDING_LENGTH];
-
-  /* Authentication data */
-  uint8_t auth[MAX_HASH_LENGTH];
 
 } CMD_Request;
 
@@ -434,7 +458,10 @@ typedef struct {
 #define RPY_MANUAL_LIST 11
 #define RPY_ACTIVITY 12
 #define RPY_SMOOTHING 13
-#define N_REPLY_TYPES 14
+#define RPY_SERVER_STATS 14
+#define RPY_CLIENT_ACCESSES_BY_INDEX2 15
+#define RPY_NTP_DATA 16
+#define N_REPLY_TYPES 17
 
 /* Status codes */
 #define STT_SUCCESS 0
@@ -481,6 +508,8 @@ typedef struct {
 
 #define RPY_SD_FLAG_NOSELECT 0x1
 #define RPY_SD_FLAG_PREFER 0x2
+#define RPY_SD_FLAG_TRUST 0x4
+#define RPY_SD_FLAG_REQUIRE 0x8
 
 typedef struct {
   IPAddr ip_addr;
@@ -502,7 +531,7 @@ typedef struct {
   IPAddr ip_addr;
   uint16_t stratum;
   uint16_t leap_status;
-  Timeval ref_time;
+  Timespec ref_time;
   Float current_correction;
   Float last_offset;
   Float rms_offset;
@@ -530,7 +559,7 @@ typedef struct {
 } RPY_Sourcestats;
 
 typedef struct {
-  Timeval ref_time;
+  Timespec ref_time;
   uint16_t n_samples;
   uint16_t n_runs;
   uint32_t span_seconds;
@@ -548,11 +577,14 @@ typedef struct {
 
 typedef struct {
   IPAddr ip;
-  uint32_t client_hits;
-  uint32_t peer_hits;
-  uint32_t cmd_hits_auth;
-  uint32_t cmd_hits_normal;
-  uint32_t cmd_hits_bad;
+  uint32_t ntp_hits;
+  uint32_t cmd_hits;
+  uint32_t ntp_drops;
+  uint32_t cmd_drops;
+  int8_t ntp_interval;
+  int8_t cmd_interval;
+  int8_t ntp_timeout_interval;
+  int8_t pad;
   uint32_t last_ntp_hit_ago;
   uint32_t last_cmd_hit_ago;
 } RPY_ClientAccesses_Client;
@@ -565,10 +597,19 @@ typedef struct {
   int32_t EOR;
 } RPY_ClientAccessesByIndex;
 
+typedef struct {
+  uint32_t ntp_hits;
+  uint32_t cmd_hits;
+  uint32_t ntp_drops;
+  uint32_t cmd_drops;
+  uint32_t log_drops;
+  int32_t EOR;
+} RPY_ServerStats;
+
 #define MAX_MANUAL_LIST_SAMPLES 16
 
 typedef struct {
-  Timeval when;
+  Timespec when;
   Float slewed_offset;
   Float orig_offset;
   Float residual;
@@ -602,6 +643,39 @@ typedef struct {
   int32_t EOR;
 } RPY_Smoothing;
 
+#define RPY_NTP_FLAGS_TESTS 0x3ff
+#define RPY_NTP_FLAG_INTERLEAVED 0x4000
+#define RPY_NTP_FLAG_AUTHENTICATED 0x8000
+
+typedef struct {
+  IPAddr remote_addr;
+  IPAddr local_addr;
+  uint16_t remote_port;
+  uint8_t leap;
+  uint8_t version;
+  uint8_t mode;
+  uint8_t stratum;
+  int8_t poll;
+  int8_t precision;
+  Float root_delay;
+  Float root_dispersion;
+  uint32_t ref_id;
+  Timespec ref_time;
+  Float offset;
+  Float peer_delay;
+  Float peer_dispersion;
+  Float response_time;
+  Float jitter_asymmetry;
+  uint16_t flags;
+  uint8_t tx_tss_char;
+  uint8_t rx_tss_char;
+  uint32_t total_tx_count;
+  uint32_t total_rx_count;
+  uint32_t total_valid_count;
+  uint32_t reserved[4];
+  int32_t EOR;
+} RPY_NTPData;
+
 typedef struct {
   uint8_t version;
   uint8_t pkt_type;
@@ -614,9 +688,9 @@ typedef struct {
   uint16_t pad2;
   uint16_t pad3;
   uint32_t sequence; /* Echo of client's sequence number */
-  uint32_t utoken; /* Unique token per incarnation of daemon */
-  uint32_t token; /* New command token (only if command was successfully
-                          authenticated) */
+  uint32_t pad4;
+  uint32_t pad5;
+
   union {
     RPY_Null null;
     RPY_N_Sources n_sources;
@@ -626,14 +700,12 @@ typedef struct {
     RPY_Sourcestats sourcestats;
     RPY_Rtc rtc;
     RPY_ClientAccessesByIndex client_accesses_by_index;
+    RPY_ServerStats server_stats;
     RPY_ManualList manual_list;
     RPY_Activity activity;
     RPY_Smoothing smoothing;
+    RPY_NTPData ntp_data;
   } data; /* Reply specific parameters */
-
-  /* authentication of the packet, there is no hole after the actual data
-     from the data union, this field only sets the maximum auth size */
-  uint8_t auth[MAX_HASH_LENGTH];
 
 } CMD_Reply;
 

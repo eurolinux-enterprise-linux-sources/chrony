@@ -3,7 +3,7 @@
 
  **********************************************************************
  * Copyright (C) Richard P. Curnow  1997-2003
- * Copyright (C) Miroslav Lichvar  2012-2014
+ * Copyright (C) Miroslav Lichvar  2012-2016
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -39,6 +39,8 @@
 #include "local.h"
 #include "logging.h"
 
+/* Consider 80 bits as the absolute minimum for a secure key */
+#define MIN_SECURE_KEY_LENGTH 10
 
 typedef struct {
   uint32_t id;
@@ -50,69 +52,9 @@ typedef struct {
 
 static ARR_Instance keys;
 
-static int command_key_valid;
-static uint32_t command_key_id;
 static int cache_valid;
 static uint32_t cache_key_id;
 static int cache_key_pos;
-
-/* ================================================== */
-
-static int
-generate_key(uint32_t key_id)
-{
-#ifdef FEAT_SECHASH
-  unsigned char key[20];
-  const char *hashname = "SHA1";
-#else
-  unsigned char key[16];
-  const char *hashname = "MD5";
-#endif
-  const char *key_file, *rand_dev = "/dev/urandom";
-  FILE *f;
-  struct stat st;
-  int i;
-
-  key_file = CNF_GetKeysFile();
-
-  if (!key_file)
-    return 0;
-
-  f = fopen(rand_dev, "r");
-  if (!f || fread(key, sizeof (key), 1, f) != 1) {
-    if (f)
-      fclose(f);
-    LOG_FATAL(LOGF_Keys, "Could not read %s", rand_dev);
-    return 0;
-  }
-  fclose(f);
-
-  f = fopen(key_file, "a");
-  if (!f) {
-    LOG_FATAL(LOGF_Keys, "Could not open keyfile %s for writing", key_file);
-    return 0;
-  }
-
-  /* Make sure the keyfile is not world-readable */
-  if (stat(key_file, &st) || chmod(key_file, st.st_mode & 0770)) {
-    fclose(f);
-    LOG_FATAL(LOGF_Keys, "Could not change permissions of keyfile %s", key_file);
-    return 0;
-  }
-
-  fprintf(f, "\n%"PRIu32" %s HEX:", key_id, hashname);
-  for (i = 0; i < sizeof (key); i++)
-    fprintf(f, "%02hhX", key[i]);
-  fprintf(f, "\n");
-  fclose(f);
-
-  /* Erase the key from stack */
-  memset(key, 0, sizeof (key));
-
-  LOG(LOGS_INFO, LOGF_Keys, "Generated key %"PRIu32, key_id);
-
-  return 1;
-}
 
 /* ================================================== */
 
@@ -125,7 +67,6 @@ free_keys(void)
     Free(((Key *)ARR_GetElement(keys, i))->val);
 
   ARR_SetSize(keys, 0);
-  command_key_valid = 0;
   cache_valid = 0;
 }
 
@@ -135,14 +76,8 @@ void
 KEY_Initialise(void)
 {
   keys = ARR_CreateInstance(sizeof (Key));
-  command_key_valid = 0;
   cache_valid = 0;
   KEY_Reload();
-
-  if (CNF_GetGenerateCommandKey() && !KEY_KeyKnown(KEY_GetCommandKey())) {
-    if (generate_key(KEY_GetCommandKey()))
-      KEY_Reload();
-  }
 }
 
 /* ================================================== */
@@ -168,9 +103,9 @@ static int
 determine_hash_delay(uint32_t key_id)
 {
   NTP_Packet pkt;
-  struct timeval before, after;
-  unsigned long usecs, min_usecs=0;
-  int i;
+  struct timespec before, after;
+  double diff, min_diff;
+  int i, nsecs;
 
   for (i = 0; i < 10; i++) {
     LCL_ReadRawTime(&before);
@@ -178,19 +113,49 @@ determine_hash_delay(uint32_t key_id)
         (unsigned char *)&pkt.auth_data, sizeof (pkt.auth_data));
     LCL_ReadRawTime(&after);
 
-    usecs = (after.tv_sec - before.tv_sec) * 1000000 + (after.tv_usec - before.tv_usec);
+    diff = UTI_DiffTimespecsToDouble(&after, &before);
 
-    if (i == 0 || usecs < min_usecs) {
-      min_usecs = usecs;
-    }
+    if (i == 0 || min_diff > diff)
+      min_diff = diff;
   }
 
   /* Add on a bit extra to allow for copying, conversions etc */
-  min_usecs += min_usecs >> 4;
+  nsecs = 1.0625e9 * min_diff;
 
-  DEBUG_LOG(LOGF_Keys, "authentication delay for key %"PRIu32": %ld useconds", key_id, min_usecs);
+  DEBUG_LOG(LOGF_Keys, "authentication delay for key %"PRIu32": %d nsecs", key_id, nsecs);
 
-  return min_usecs;
+  return nsecs;
+}
+
+/* ================================================== */
+/* Decode password encoded in ASCII or HEX */
+
+static int
+decode_password(char *key)
+{
+  int i, j, len = strlen(key);
+  char buf[3], *p;
+
+  if (!strncmp(key, "ASCII:", 6)) {
+    memmove(key, key + 6, len - 6);
+    return len - 6;
+  } else if (!strncmp(key, "HEX:", 4)) {
+    if ((len - 4) % 2)
+      return 0;
+
+    for (i = 0, j = 4; j + 1 < len; i++, j += 2) {
+      buf[0] = key[j], buf[1] = key[j + 1], buf[2] = '\0';
+      key[i] = strtol(buf, &p, 16);
+
+      if (p != buf + 2)
+        return 0;
+    }
+
+    return i;
+  } else {
+    /* assume ASCII */
+    return len;
+  }
 }
 
 /* ================================================== */
@@ -257,7 +222,7 @@ KEY_Reload(void)
       continue;
     }
 
-    key.len = UTI_DecodePasswordFromText(keyval);
+    key.len = decode_password(keyval);
     if (!key.len) {
       LOG(LOGS_WARN, LOGF_Keys, "Could not decode password in key %"PRIu32, key_id);
       continue;
@@ -334,18 +299,6 @@ get_key_by_id(uint32_t key_id)
 
 /* ================================================== */
 
-uint32_t
-KEY_GetCommandKey(void)
-{
-  if (!command_key_valid) {
-    command_key_id = CNF_GetCommandKey();
-  }
-
-  return command_key_id;
-}
-
-/* ================================================== */
-
 int
 KEY_KeyKnown(uint32_t key_id)
 {
@@ -370,6 +323,62 @@ KEY_GetAuthDelay(uint32_t key_id)
 /* ================================================== */
 
 int
+KEY_GetAuthLength(uint32_t key_id)
+{
+  unsigned char buf[MAX_HASH_LENGTH];
+  Key *key;
+
+  key = get_key_by_id(key_id);
+
+  if (!key)
+    return 0;
+
+  return HSH_Hash(key->hash_id, buf, 0, buf, 0, buf, sizeof (buf));
+}
+
+/* ================================================== */
+
+int
+KEY_CheckKeyLength(uint32_t key_id)
+{
+  Key *key;
+
+  key = get_key_by_id(key_id);
+
+  if (!key)
+    return 0;
+
+  return key->len >= MIN_SECURE_KEY_LENGTH;
+}
+
+/* ================================================== */
+
+static int
+generate_ntp_auth(int hash_id, const unsigned char *key, int key_len,
+                  const unsigned char *data, int data_len,
+                  unsigned char *auth, int auth_len)
+{
+  return HSH_Hash(hash_id, key, key_len, data, data_len, auth, auth_len);
+}
+
+/* ================================================== */
+
+static int
+check_ntp_auth(int hash_id, const unsigned char *key, int key_len,
+               const unsigned char *data, int data_len,
+               const unsigned char *auth, int auth_len, int trunc_len)
+{
+  unsigned char buf[MAX_HASH_LENGTH];
+  int hash_len;
+
+  hash_len = generate_ntp_auth(hash_id, key, key_len, data, data_len, buf, sizeof (buf));
+
+  return MIN(hash_len, trunc_len) == auth_len && !memcmp(buf, auth, auth_len);
+}
+
+/* ================================================== */
+
+int
 KEY_GenerateAuth(uint32_t key_id, const unsigned char *data, int data_len,
     unsigned char *auth, int auth_len)
 {
@@ -380,15 +389,15 @@ KEY_GenerateAuth(uint32_t key_id, const unsigned char *data, int data_len,
   if (!key)
     return 0;
 
-  return UTI_GenerateNTPAuth(key->hash_id, (unsigned char *)key->val,
-                             key->len, data, data_len, auth, auth_len);
+  return generate_ntp_auth(key->hash_id, (unsigned char *)key->val, key->len,
+                           data, data_len, auth, auth_len);
 }
 
 /* ================================================== */
 
 int
 KEY_CheckAuth(uint32_t key_id, const unsigned char *data, int data_len,
-    const unsigned char *auth, int auth_len)
+              const unsigned char *auth, int auth_len, int trunc_len)
 {
   Key *key;
 
@@ -397,6 +406,6 @@ KEY_CheckAuth(uint32_t key_id, const unsigned char *data, int data_len,
   if (!key)
     return 0;
 
-  return UTI_CheckNTPAuth(key->hash_id, (unsigned char *)key->val,
-                          key->len, data, data_len, auth, auth_len);
+  return check_ntp_auth(key->hash_id, (unsigned char *)key->val, key->len,
+                        data, data_len, auth, auth_len, trunc_len);
 }

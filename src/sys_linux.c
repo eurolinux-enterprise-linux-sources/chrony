@@ -4,7 +4,7 @@
  **********************************************************************
  * Copyright (C) Richard P. Curnow  1997-2003
  * Copyright (C) John G. Hasler  2009
- * Copyright (C) Miroslav Lichvar  2009-2012, 2014
+ * Copyright (C) Miroslav Lichvar  2009-2012, 2014-2016
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -35,31 +35,55 @@
 
 #if defined(HAVE_SCHED_SETSCHEDULER)
 #  include <sched.h>
-int SchedPriority = 0;
 #endif
 
 #if defined(HAVE_MLOCKALL)
 #  include <sys/mman.h>
 #include <sys/resource.h>
-int LockAll = 0;
 #endif
 
 #ifdef FEAT_PRIVDROP
-#include <sys/types.h>
-#include <pwd.h>
 #include <sys/prctl.h>
 #include <sys/capability.h>
-#include <grp.h>
 #endif
 
-#include "sys_generic.h"
-#include "sys_linux.h"
-#include "conf.h"
-#include "logging.h"
-#include "wrap_adjtimex.h"
+#if defined(FEAT_PHC) || defined(HAVE_LINUX_TIMESTAMPING)
+#include <linux/ptp_clock.h>
+#endif
 
-/* The threshold for adjtimex maxerror when the kernel sets the UNSYNC flag */
-#define UNSYNC_MAXERROR 16.0
+#ifdef FEAT_SCFILTER
+#include <sys/prctl.h>
+#include <seccomp.h>
+#include <termios.h>
+#ifdef FEAT_PPS
+#include <linux/pps.h>
+#endif
+#ifdef FEAT_RTC
+#include <linux/rtc.h>
+#endif
+#ifdef HAVE_LINUX_TIMESTAMPING
+#include <linux/sockios.h>
+#endif
+#endif
+
+#include "sys_linux.h"
+#include "sys_timex.h"
+#include "conf.h"
+#include "local.h"
+#include "logging.h"
+#include "privops.h"
+#include "util.h"
+
+/* Frequency scale to convert from ppm to the timex freq */
+#define FREQ_SCALE (double)(1 << 16)
+
+/* Definitions used if missed in the system headers */
+#ifndef ADJ_SETOFFSET
+#define ADJ_SETOFFSET           0x0100  /* add 'time' to current time */
+#endif
+#ifndef ADJ_NANO
+#define ADJ_NANO                0x2000  /* select nanosecond resolution */
+#endif
 
 /* This is the uncompensated system tick value */
 static int nominal_tick;
@@ -103,10 +127,18 @@ our_round(double x)
 static int
 apply_step_offset(double offset)
 {
-  if (TMX_ApplyStepOffset(-offset) < 0) {
-    DEBUG_LOG(LOGF_SysLinux, "adjtimex() failed");
-    return 0;
+  struct timex txc;
+
+  txc.modes = ADJ_SETOFFSET | ADJ_NANO;
+  txc.time.tv_sec = -offset;
+  txc.time.tv_usec = 1.0e9 * (-offset - txc.time.tv_sec);
+  if (txc.time.tv_usec < 0) {
+    txc.time.tv_sec--;
+    txc.time.tv_usec += 1000000000;
   }
+
+  if (SYS_Timex_Adjust(&txc, 1) < 0)
+    return 0;
 
   return 1;
 }
@@ -121,6 +153,7 @@ apply_step_offset(double offset)
 static double
 set_frequency(double freq_ppm)
 {
+  struct timex txc;
   long required_tick;
   double required_freq;
   int required_delta_tick;
@@ -144,14 +177,15 @@ set_frequency(double freq_ppm)
   required_freq = -(freq_ppm - dhz * required_delta_tick);
   required_tick = nominal_tick - required_delta_tick;
 
-  if (TMX_SetFrequency(&required_freq, required_tick) < 0) {
-    LOG_FATAL(LOGF_SysLinux, "adjtimex failed for set_frequency, freq_ppm=%10.4e required_freq=%10.4e required_tick=%ld",
-        freq_ppm, required_freq, required_tick);
-  }
+  txc.modes = ADJ_TICK | ADJ_FREQUENCY;
+  txc.freq = required_freq * FREQ_SCALE;
+  txc.tick = required_tick;
+
+  SYS_Timex_Adjust(&txc, 0);
 
   current_delta_tick = required_delta_tick;
 
-  return dhz * current_delta_tick - required_freq;
+  return dhz * current_delta_tick - txc.freq / FREQ_SCALE;
 }
 
 /* ================================================== */
@@ -160,61 +194,15 @@ set_frequency(double freq_ppm)
 static double
 read_frequency(void)
 {
-  long tick;
-  double freq;
+  struct timex txc;
 
-  if (TMX_GetFrequency(&freq, &tick) < 0) {
-    LOG_FATAL(LOGF_SysLinux, "adjtimex() failed");
-  }
+  txc.modes = 0;
 
-  current_delta_tick = nominal_tick - tick;
-  
-  return dhz * current_delta_tick - freq;
-}
+  SYS_Timex_Adjust(&txc, 0);
 
-/* ================================================== */
+  current_delta_tick = nominal_tick - txc.tick;
 
-static void
-set_leap(int leap)
-{
-  int current_leap;
-
-  if (TMX_GetLeap(&current_leap) < 0) {
-    LOG_FATAL(LOGF_SysLinux, "adjtimex() failed in set_leap");
-  }
-
-  if (current_leap == leap)
-    return;
-
-  if (TMX_SetLeap(leap) < 0) {
-    LOG_FATAL(LOGF_SysLinux, "adjtimex() failed in set_leap");
-  }
-
-  LOG(LOGS_INFO, LOGF_SysLinux, "System clock status set to %s leap second",
-     leap ? (leap > 0 ? "insert" : "delete") : "not insert/delete");
-}
-
-/* ================================================== */
-
-static void
-set_sync_status(int synchronised, double est_error, double max_error)
-{
-  if (synchronised) {
-    if (est_error > UNSYNC_MAXERROR)
-      est_error = UNSYNC_MAXERROR;
-    if (max_error >= UNSYNC_MAXERROR) {
-      max_error = UNSYNC_MAXERROR;
-      synchronised = 0;
-    }
-  } else {
-    est_error = max_error = UNSYNC_MAXERROR;
-  }
-
-  /* Clear the UNSYNC flag only if rtcsync is enabled */
-  if (!CNF_GetRtcSync())
-    synchronised = 0;
-
-  TMX_SetSync(synchronised, est_error, max_error);
+  return dhz * current_delta_tick - txc.freq / FREQ_SCALE;
 }
 
 /* ================================================== */
@@ -225,10 +213,16 @@ set_sync_status(int synchronised, double est_error, double max_error)
  * a +/- 10% movement of tick away from the nominal value 1e6/USER_HZ. */
 
 static int
-guess_hz(int tick)
+guess_hz(void)
 {
-  int i, tick_lo, tick_hi, ihz;
+  struct timex txc;
+  int i, tick, tick_lo, tick_hi, ihz;
   double tick_nominal;
+
+  txc.modes = 0;
+  SYS_Timex_Adjust(&txc, 0);
+  tick = txc.tick;
+
   /* Pick off the hz=100 case first */
   if (tick >= 9000 && tick <= 11000) {
     return 100;
@@ -246,6 +240,8 @@ guess_hz(int tick)
   }
 
   /* oh dear.  doomed. */
+  LOG_FATAL(LOGF_SysLinux, "Can't determine hz from tick %d", tick);
+
   return 0;
 }
 
@@ -280,6 +276,22 @@ kernelvercmp(int major1, int minor1, int patch1,
 }
 
 /* ================================================== */
+
+static void
+get_kernel_version(int *major, int *minor, int *patch)
+{
+  struct utsname uts;
+
+  if (uname(&uts) < 0)
+    LOG_FATAL(LOGF_SysLinux, "uname() failed");
+
+  *patch = 0;
+  if (sscanf(uts.release, "%d.%d.%d", major, minor, patch) < 2)
+    LOG_FATAL(LOGF_SysLinux, "Could not parse kernel version");
+}
+
+/* ================================================== */
+
 /* Compute the scaling to use on any frequency we set, according to
    the vintage of the Linux kernel being used. */
 
@@ -287,21 +299,11 @@ static void
 get_version_specific_details(void)
 {
   int major, minor, patch;
-  long tick;
-  double freq;
-  struct utsname uts;
   
   hz = get_hz();
 
-  if (!hz) {
-    if (TMX_GetFrequency(&freq, &tick) < 0)
-      LOG_FATAL(LOGF_SysLinux, "adjtimex() failed");
-
-    hz = guess_hz(tick);
-
-    if (!hz)
-      LOG_FATAL(LOGF_SysLinux, "Can't determine hz from tick %ld", tick);
-  }
+  if (!hz)
+    hz = guess_hz();
 
   dhz = (double) hz;
   nominal_tick = (1000000L + (hz/2))/hz; /* Mirror declaration in kernel */
@@ -311,15 +313,7 @@ get_version_specific_details(void)
      (CONFIG_NO_HZ aka tickless), assume the lowest commonly used fixed rate */
   tick_update_hz = 100;
 
-  if (uname(&uts) < 0) {
-    LOG_FATAL(LOGF_SysLinux, "Cannot uname(2) to get kernel version, sorry.");
-  }
-
-  patch = 0;
-  if (sscanf(uts.release, "%d.%d.%d", &major, &minor, &patch) < 2) {
-    LOG_FATAL(LOGF_SysLinux, "Cannot read information from uname, sorry");
-  }
-
+  get_kernel_version(&major, &minor, &patch);
   DEBUG_LOG(LOGF_SysLinux, "Linux kernel major=%d minor=%d patch=%d", major, minor, patch);
 
   if (kernelvercmp(major, minor, patch, 2, 2, 0) < 0) {
@@ -345,6 +339,48 @@ get_version_specific_details(void)
 }
 
 /* ================================================== */
+
+static void
+reset_adjtime_offset(void)
+{
+  struct timex txc;
+
+  /* Reset adjtime() offset */
+  txc.modes = ADJ_OFFSET_SINGLESHOT;
+  txc.offset = 0;
+
+  SYS_Timex_Adjust(&txc, 0);
+}
+
+/* ================================================== */
+
+static int
+test_step_offset(void)
+{
+  struct timex txc;
+
+  /* Zero maxerror and check it's reset to a maximum after ADJ_SETOFFSET.
+     This seems to be the only way how to verify that the kernel really
+     supports the ADJ_SETOFFSET mode as it doesn't return an error on unknown
+     mode. */
+
+  txc.modes = MOD_MAXERROR;
+  txc.maxerror = 0;
+
+  if (SYS_Timex_Adjust(&txc, 1) < 0 || txc.maxerror != 0)
+    return 0;
+
+  txc.modes = ADJ_SETOFFSET | ADJ_NANO;
+  txc.time.tv_sec = 0;
+  txc.time.tv_usec = 0;
+
+  if (SYS_Timex_Adjust(&txc, 1) < 0 || txc.maxerror < 100000)
+    return 0;
+
+  return 1;
+}
+
+/* ================================================== */
 /* Initialisation code for this module */
 
 void
@@ -352,20 +388,18 @@ SYS_Linux_Initialise(void)
 {
   get_version_specific_details();
 
-  if (TMX_ResetOffset() < 0) {
-    LOG_FATAL(LOGF_SysLinux, "adjtimex() failed");
-  }
+  reset_adjtime_offset();
 
-  if (have_setoffset && TMX_TestStepOffset() < 0) {
+  if (have_setoffset && !test_step_offset()) {
     LOG(LOGS_INFO, LOGF_SysLinux, "adjtimex() doesn't support ADJ_SETOFFSET");
     have_setoffset = 0;
   }
 
-  SYS_Generic_CompleteFreqDriver(1.0e6 * max_tick_bias / nominal_tick,
-                                 1.0 / tick_update_hz,
-                                 read_frequency, set_frequency,
-                                 have_setoffset ? apply_step_offset : NULL,
-                                 set_leap, set_sync_status);
+  SYS_Timex_InitialiseWithFunctions(1.0e6 * max_tick_bias / nominal_tick,
+                                    1.0 / tick_update_hz,
+                                    read_frequency, set_frequency,
+                                    have_setoffset ? apply_step_offset : NULL,
+                                    0.0, 0.0, NULL, NULL);
 }
 
 /* ================================================== */
@@ -374,42 +408,29 @@ SYS_Linux_Initialise(void)
 void
 SYS_Linux_Finalise(void)
 {
-  SYS_Generic_Finalise();
+  SYS_Timex_Finalise();
 }
 
 /* ================================================== */
 
 #ifdef FEAT_PRIVDROP
 void
-SYS_Linux_DropRoot(char *user)
+SYS_Linux_DropRoot(uid_t uid, gid_t gid)
 {
-  struct passwd *pw;
+  const char *cap_text;
   cap_t cap;
-
-  if (user == NULL)
-    return;
-
-  if ((pw = getpwnam(user)) == NULL) {
-    LOG_FATAL(LOGF_SysLinux, "getpwnam(%s) failed", user);
-  }
 
   if (prctl(PR_SET_KEEPCAPS, 1)) {
     LOG_FATAL(LOGF_SysLinux, "prctl() failed");
   }
   
-  if (setgroups(0, NULL)) {
-    LOG_FATAL(LOGF_SysLinux, "setgroups() failed");
-  }
+  UTI_DropRoot(uid, gid);
 
-  if (setgid(pw->pw_gid)) {
-    LOG_FATAL(LOGF_SysLinux, "setgid(%d) failed", pw->pw_gid);
-  }
+  /* Keep CAP_NET_BIND_SERVICE only if NTP port can be opened */
+  cap_text = CNF_GetNTPPort() ?
+             "cap_net_bind_service,cap_sys_time=ep" : "cap_sys_time=ep";
 
-  if (setuid(pw->pw_uid)) {
-    LOG_FATAL(LOGF_SysLinux, "setuid(%d) failed", pw->pw_uid);
-  }
-
-  if ((cap = cap_from_text("cap_net_bind_service,cap_sys_time=ep")) == NULL) {
+  if ((cap = cap_from_text(cap_text)) == NULL) {
     LOG_FATAL(LOGF_SysLinux, "cap_from_text() failed");
   }
 
@@ -418,8 +439,162 @@ SYS_Linux_DropRoot(char *user)
   }
 
   cap_free(cap);
+}
+#endif
 
-  DEBUG_LOG(LOGF_SysLinux, "Privileges dropped to user %s", user);
+/* ================================================== */
+
+#ifdef FEAT_SCFILTER
+static
+void check_seccomp_applicability(void)
+{
+  int mail_enabled;
+  double mail_threshold;
+  char *mail_user;
+
+  CNF_GetMailOnChange(&mail_enabled, &mail_threshold, &mail_user);
+  if (mail_enabled)
+    LOG_FATAL(LOGF_SysLinux, "mailonchange directive cannot be used with -F enabled");
+}
+
+/* ================================================== */
+
+void
+SYS_Linux_EnableSystemCallFilter(int level)
+{
+  const int syscalls[] = {
+    /* Clock */
+    SCMP_SYS(adjtimex), SCMP_SYS(clock_gettime), SCMP_SYS(gettimeofday),
+    SCMP_SYS(settimeofday), SCMP_SYS(time),
+    /* Process */
+    SCMP_SYS(clone), SCMP_SYS(exit), SCMP_SYS(exit_group), SCMP_SYS(getrlimit),
+    SCMP_SYS(rt_sigaction), SCMP_SYS(rt_sigreturn), SCMP_SYS(rt_sigprocmask),
+    SCMP_SYS(set_tid_address), SCMP_SYS(sigreturn), SCMP_SYS(wait4),
+    /* Memory */
+    SCMP_SYS(brk), SCMP_SYS(madvise), SCMP_SYS(mmap), SCMP_SYS(mmap2),
+    SCMP_SYS(mprotect), SCMP_SYS(mremap), SCMP_SYS(munmap), SCMP_SYS(shmdt),
+    /* Filesystem */
+    SCMP_SYS(access), SCMP_SYS(chmod), SCMP_SYS(chown), SCMP_SYS(chown32),
+    SCMP_SYS(fstat), SCMP_SYS(fstat64), SCMP_SYS(getdents), SCMP_SYS(getdents64),
+    SCMP_SYS(lseek), SCMP_SYS(rename), SCMP_SYS(stat), SCMP_SYS(stat64),
+    SCMP_SYS(statfs), SCMP_SYS(statfs64), SCMP_SYS(unlink),
+    /* Socket */
+    SCMP_SYS(bind), SCMP_SYS(connect), SCMP_SYS(getsockname),
+    SCMP_SYS(recvfrom), SCMP_SYS(recvmmsg), SCMP_SYS(recvmsg),
+    SCMP_SYS(sendmmsg), SCMP_SYS(sendmsg), SCMP_SYS(sendto),
+    /* TODO: check socketcall arguments */
+    SCMP_SYS(socketcall),
+    /* General I/O */
+    SCMP_SYS(_newselect), SCMP_SYS(close), SCMP_SYS(open), SCMP_SYS(openat), SCMP_SYS(pipe),
+    SCMP_SYS(poll), SCMP_SYS(read), SCMP_SYS(futex), SCMP_SYS(select),
+    SCMP_SYS(set_robust_list), SCMP_SYS(write),
+    /* Miscellaneous */
+    SCMP_SYS(uname),
+  };
+
+  const int socket_domains[] = {
+    AF_NETLINK, AF_UNIX, AF_INET,
+#ifdef FEAT_IPV6
+    AF_INET6,
+#endif
+  };
+
+  const static int socket_options[][2] = {
+    { SOL_IP, IP_PKTINFO }, { SOL_IP, IP_FREEBIND },
+#ifdef FEAT_IPV6
+    { SOL_IPV6, IPV6_V6ONLY }, { SOL_IPV6, IPV6_RECVPKTINFO },
+#endif
+    { SOL_SOCKET, SO_BROADCAST }, { SOL_SOCKET, SO_REUSEADDR },
+    { SOL_SOCKET, SO_TIMESTAMP }, { SOL_SOCKET, SO_TIMESTAMPNS },
+#ifdef HAVE_LINUX_TIMESTAMPING
+    { SOL_SOCKET, SO_SELECT_ERR_QUEUE }, { SOL_SOCKET, SO_TIMESTAMPING },
+#endif
+  };
+
+  const static int fcntls[] = { F_GETFD, F_SETFD };
+
+  const static unsigned long ioctls[] = {
+    FIONREAD, TCGETS,
+#if defined(FEAT_PHC) || defined(HAVE_LINUX_TIMESTAMPING)
+    PTP_SYS_OFFSET,
+#ifdef PTP_SYS_OFFSET_PRECISE
+    PTP_SYS_OFFSET_PRECISE,
+#endif
+#endif
+#ifdef FEAT_PPS
+    PPS_FETCH,
+#endif
+#ifdef FEAT_RTC
+    RTC_RD_TIME, RTC_SET_TIME, RTC_UIE_ON, RTC_UIE_OFF,
+#endif
+#ifdef HAVE_LINUX_TIMESTAMPING
+    SIOCETHTOOL,
+#endif
+  };
+
+  scmp_filter_ctx *ctx;
+  int i;
+
+  /* Check if the chronyd configuration is supported */
+  check_seccomp_applicability();
+
+  /* Start the helper process, which will run without any seccomp filter.  It
+     will be used for getaddrinfo(), for which it's difficult to maintain a
+     list of required system calls (with glibc it depends on what NSS modules
+     are installed and enabled on the system). */
+  PRV_StartHelper();
+
+  ctx = seccomp_init(level > 0 ? SCMP_ACT_KILL : SCMP_ACT_TRAP);
+  if (ctx == NULL)
+      LOG_FATAL(LOGF_SysLinux, "Failed to initialize seccomp");
+
+  /* Add system calls that are always allowed */
+  for (i = 0; i < (sizeof (syscalls) / sizeof (*syscalls)); i++) {
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, syscalls[i], 0) < 0)
+      goto add_failed;
+  }
+
+  /* Allow sockets to be created only in selected domains */
+  for (i = 0; i < sizeof (socket_domains) / sizeof (*socket_domains); i++) {
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+                         SCMP_A0(SCMP_CMP_EQ, socket_domains[i])) < 0)
+      goto add_failed;
+  }
+
+  /* Allow setting only selected sockets options */
+  for (i = 0; i < sizeof (socket_options) / sizeof (*socket_options); i++) {
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(setsockopt), 3,
+                         SCMP_A1(SCMP_CMP_EQ, socket_options[i][0]),
+                         SCMP_A2(SCMP_CMP_EQ, socket_options[i][1]),
+                         SCMP_A4(SCMP_CMP_LE, sizeof (int))) < 0)
+      goto add_failed;
+  }
+
+  /* Allow only selected fcntl calls */
+  for (i = 0; i < sizeof (fcntls) / sizeof (*fcntls); i++) {
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 1,
+                         SCMP_A1(SCMP_CMP_EQ, fcntls[i])) < 0 ||
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl64), 1,
+                         SCMP_A1(SCMP_CMP_EQ, fcntls[i])) < 0)
+      goto add_failed;
+  }
+
+  /* Allow only selected ioctls */
+  for (i = 0; i < sizeof (ioctls) / sizeof (*ioctls); i++) {
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
+                         SCMP_A1(SCMP_CMP_EQ, ioctls[i])) < 0)
+      goto add_failed;
+  }
+
+  if (seccomp_load(ctx) < 0)
+    LOG_FATAL(LOGF_SysLinux, "Failed to load seccomp rules");
+
+  LOG(LOGS_INFO, LOGF_SysLinux, "Loaded seccomp filter");
+  seccomp_release(ctx);
+  return;
+
+add_failed:
+  LOG_FATAL(LOGF_SysLinux, "Failed to add seccomp rules");
 }
 #endif
 
@@ -479,3 +654,163 @@ void SYS_Linux_MemLockAll(int LockAll)
   }
 }
 #endif /* HAVE_MLOCKALL */
+
+/* ================================================== */
+
+int
+SYS_Linux_CheckKernelVersion(int req_major, int req_minor)
+{
+  int major, minor, patch;
+
+  get_kernel_version(&major, &minor, &patch);
+
+  return kernelvercmp(req_major, req_minor, 0, major, minor, patch) <= 0;
+}
+
+/* ================================================== */
+
+#if defined(FEAT_PHC) || defined(HAVE_LINUX_TIMESTAMPING)
+
+#define PHC_READINGS 10
+
+static int
+get_phc_sample(int phc_fd, double precision, struct timespec *phc_ts,
+               struct timespec *sys_ts, double *err)
+{
+  struct ptp_sys_offset sys_off;
+  struct timespec ts1, ts2, ts3, phc_tss[PHC_READINGS], sys_tss[PHC_READINGS];
+  double min_delay = 0.0, delays[PHC_READINGS], phc_sum, sys_sum, sys_prec;
+  int i, n;
+
+  /* Silence valgrind */
+  memset(&sys_off, 0, sizeof (sys_off));
+
+  sys_off.n_samples = PHC_READINGS;
+
+  if (ioctl(phc_fd, PTP_SYS_OFFSET, &sys_off)) {
+    DEBUG_LOG(LOGF_SysLinux, "ioctl(%s) failed : %s", "PTP_SYS_OFFSET", strerror(errno));
+    return 0;
+  }
+
+  for (i = 0; i < PHC_READINGS; i++) {
+    ts1.tv_sec = sys_off.ts[i * 2].sec;
+    ts1.tv_nsec = sys_off.ts[i * 2].nsec;
+    ts2.tv_sec = sys_off.ts[i * 2 + 1].sec;
+    ts2.tv_nsec = sys_off.ts[i * 2 + 1].nsec;
+    ts3.tv_sec = sys_off.ts[i * 2 + 2].sec;
+    ts3.tv_nsec = sys_off.ts[i * 2 + 2].nsec;
+
+    sys_tss[i] = ts1;
+    phc_tss[i] = ts2;
+    delays[i] = UTI_DiffTimespecsToDouble(&ts3, &ts1);
+
+    if (delays[i] <= 0.0)
+      /* Step in the middle of a PHC reading? */
+      return 0;
+
+    if (!i || delays[i] < min_delay)
+      min_delay = delays[i];
+  }
+
+  sys_prec = LCL_GetSysPrecisionAsQuantum();
+
+  /* Combine best readings */
+  for (i = n = 0, phc_sum = sys_sum = 0.0; i < PHC_READINGS; i++) {
+    if (delays[i] > min_delay + MAX(sys_prec, precision))
+      continue;
+
+    phc_sum += UTI_DiffTimespecsToDouble(&phc_tss[i], &phc_tss[0]);
+    sys_sum += UTI_DiffTimespecsToDouble(&sys_tss[i], &sys_tss[0]) + delays[i] / 2.0;
+    n++;
+  }
+
+  assert(n);
+
+  UTI_AddDoubleToTimespec(&phc_tss[0], phc_sum / n, phc_ts);
+  UTI_AddDoubleToTimespec(&sys_tss[0], sys_sum / n, sys_ts);
+  *err = MAX(min_delay / 2.0, precision);
+
+  return 1;
+}
+/* ================================================== */
+
+static int
+get_precise_phc_sample(int phc_fd, double precision, struct timespec *phc_ts,
+		       struct timespec *sys_ts, double *err)
+{
+#ifdef PTP_SYS_OFFSET_PRECISE
+  struct ptp_sys_offset_precise sys_off;
+
+  /* Silence valgrind */
+  memset(&sys_off, 0, sizeof (sys_off));
+
+  if (ioctl(phc_fd, PTP_SYS_OFFSET_PRECISE, &sys_off)) {
+    DEBUG_LOG(LOGF_SysLinux, "ioctl(%s) failed : %s", "PTP_SYS_OFFSET_PRECISE",
+              strerror(errno));
+    return 0;
+  }
+
+  phc_ts->tv_sec = sys_off.device.sec;
+  phc_ts->tv_nsec = sys_off.device.nsec;
+  sys_ts->tv_sec = sys_off.sys_realtime.sec;
+  sys_ts->tv_nsec = sys_off.sys_realtime.nsec;
+  *err = MAX(LCL_GetSysPrecisionAsQuantum(), precision);
+
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+/* ================================================== */
+
+int
+SYS_Linux_OpenPHC(const char *path, int phc_index)
+{
+  struct ptp_clock_caps caps;
+  char phc_path[64];
+  int phc_fd;
+
+  if (!path) {
+    if (snprintf(phc_path, sizeof (phc_path), "/dev/ptp%d", phc_index) >= sizeof (phc_path))
+      return -1;
+    path = phc_path;
+  }
+
+  phc_fd = open(path, O_RDONLY);
+  if (phc_fd < 0) {
+    LOG(LOGS_ERR, LOGF_SysLinux, "Could not open %s : %s", path, strerror(errno));
+    return -1;
+  }
+
+  /* Make sure it is a PHC */
+  if (ioctl(phc_fd, PTP_CLOCK_GETCAPS, &caps)) {
+    LOG(LOGS_ERR, LOGF_SysLinux, "ioctl(%s) failed : %s", "PTP_CLOCK_GETCAPS", strerror(errno));
+    close(phc_fd);
+    return -1;
+  }
+
+  UTI_FdSetCloexec(phc_fd);
+
+  return phc_fd;
+}
+
+/* ================================================== */
+
+int
+SYS_Linux_GetPHCSample(int fd, int nocrossts, double precision, int *reading_mode,
+                       struct timespec *phc_ts, struct timespec *sys_ts, double *err)
+{
+  if ((*reading_mode == 2 || !*reading_mode) && !nocrossts &&
+      get_precise_phc_sample(fd, precision, phc_ts, sys_ts, err)) {
+    *reading_mode = 2;
+    return 1;
+  } else if ((*reading_mode == 1 || !*reading_mode) &&
+      get_phc_sample(fd, precision, phc_ts, sys_ts, err)) {
+    *reading_mode = 1;
+    return 1;
+  }
+  return 0;
+}
+
+#endif

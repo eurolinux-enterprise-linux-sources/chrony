@@ -31,10 +31,19 @@ extern void SYS_Linux_Initialise(void);
 
 extern void SYS_Linux_Finalise(void);
 
-extern void SYS_Linux_DropRoot(char *user);
+extern void SYS_Linux_DropRoot(uid_t uid, gid_t gid);
+
+extern void SYS_Linux_EnableSystemCallFilter(int level);
 
 extern void SYS_Linux_MemLockAll(int LockAll);
 
 extern void SYS_Linux_SetScheduler(int SchedPriority);
+
+extern int SYS_Linux_CheckKernelVersion(int req_major, int req_minor);
+
+extern int SYS_Linux_OpenPHC(const char *path, int phc_index);
+
+extern int SYS_Linux_GetPHCSample(int fd, int nocrossts, double precision, int *reading_mode,
+                                  struct timespec *phc_ts, struct timespec *sys_ts, double *err);
 
 #endif  /* GOT_SYS_LINUX_H */

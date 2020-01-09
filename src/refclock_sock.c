@@ -37,22 +37,34 @@
 #define SOCK_MAGIC 0x534f434b
 
 struct sock_sample {
+  /* Time of the measurement (system time) */
   struct timeval tv;
+
+  /* Offset between the true time and the system time (in seconds) */
   double offset;
+
+  /* Non-zero if the sample is from a PPS signal, i.e. another source
+     is needed to obtain seconds */
   int pulse;
+
+  /* 0 - normal, 1 - insert leap second, 2 - delete leap second */
   int leap;
+
+  /* Padding, ignored */
   int _pad;
+
+  /* Protocol identifier (0x534f434b) */
   int magic;
 };
 
-static void read_sample(void *anything)
+static void read_sample(int sockfd, int event, void *anything)
 {
   struct sock_sample sample;
+  struct timespec ts;
   RCL_Instance instance;
-  int sockfd, s;
+  int s;
 
   instance = (RCL_Instance)anything;
-  sockfd = (long)RCL_GetDriverData(instance);
 
   s = recv(sockfd, &sample, sizeof (sample), 0);
 
@@ -74,10 +86,13 @@ static void read_sample(void *anything)
     return;
   }
 
+  UTI_TimevalToTimespec(&sample.tv, &ts);
+  UTI_NormaliseTimespec(&ts);
+
   if (sample.pulse) {
-    RCL_AddPulse(instance, &sample.tv, sample.offset);
+    RCL_AddPulse(instance, &ts, sample.offset);
   } else {
-    RCL_AddSample(instance, &sample.tv, sample.offset, sample.leap);
+    RCL_AddSample(instance, &ts, sample.offset, sample.leap);
   }
 }
 
@@ -110,7 +125,7 @@ static int sock_initialise(RCL_Instance instance)
   }
 
   RCL_SetDriverData(instance, (void *)(long)sockfd);
-  SCH_AddInputFileHandler(sockfd, read_sample, instance);
+  SCH_AddFileHandler(sockfd, SCH_FILE_INPUT, read_sample, instance);
   return 1;
 }
 
@@ -119,7 +134,7 @@ static void sock_finalise(RCL_Instance instance)
   int sockfd;
 
   sockfd = (long)RCL_GetDriverData(instance);
-  SCH_RemoveInputFileHandler(sockfd);
+  SCH_RemoveFileHandler(sockfd);
   close(sockfd);
 }
 

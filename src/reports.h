@@ -29,8 +29,7 @@
 
 #include "sysincl.h"
 #include "addressing.h"
-
-#define REPORT_INVALID_OFFSET 0x80000000
+#include "ntp.h"
 
 typedef struct {
   IPAddr ip_addr;
@@ -38,7 +37,7 @@ typedef struct {
   int poll;
   enum {RPT_NTP_CLIENT, RPT_NTP_PEER, RPT_LOCAL_REFERENCE} mode;
   enum {RPT_SYNC, RPT_UNREACH, RPT_FALSETICKER, RPT_JITTERY, RPT_CANDIDATE, RPT_OUTLIER} state;
-  enum {RPT_NORMAL, RPT_PREFER, RPT_NOSELECT} sel_option;
+  int sel_options;
 
   int reachability;
   unsigned long latest_meas_ago; /* seconds */
@@ -50,9 +49,9 @@ typedef struct {
 typedef struct {
   uint32_t ref_id;
   IPAddr ip_addr;
-  unsigned long stratum;
-  unsigned long leap_status;
-  struct timeval ref_time;
+  int stratum;
+  NTP_Leap leap_status;
+  struct timespec ref_time;
   double current_correction;
   double last_offset;
   double rms_offset;
@@ -78,7 +77,7 @@ typedef struct {
 } RPT_SourcestatsReport;
 
 typedef struct {
-  struct timeval ref_time;
+  struct timespec ref_time;
   unsigned short n_samples;
   unsigned short n_runs;
   unsigned long span_seconds;
@@ -88,17 +87,27 @@ typedef struct {
 
 typedef struct {
   IPAddr ip_addr;
-  unsigned long client_hits;
-  unsigned long peer_hits;
-  unsigned long cmd_hits_auth;
-  unsigned long cmd_hits_normal;
-  unsigned long cmd_hits_bad;
-  unsigned long last_ntp_hit_ago;
-  unsigned long last_cmd_hit_ago;
+  uint32_t ntp_hits;
+  uint32_t cmd_hits;
+  uint16_t ntp_drops;
+  uint16_t cmd_drops;
+  int8_t ntp_interval;
+  int8_t cmd_interval;
+  int8_t ntp_timeout_interval;
+  uint32_t last_ntp_hit_ago;
+  uint32_t last_cmd_hit_ago;
 } RPT_ClientAccessByIndex_Report;
 
 typedef struct {
-  struct timeval when;
+  uint32_t ntp_hits;
+  uint32_t cmd_hits;
+  uint32_t ntp_drops;
+  uint32_t cmd_drops;
+  uint32_t log_drops;
+} RPT_ServerStatsReport;
+
+typedef struct {
+  struct timespec when;
   double slewed_offset;
   double orig_offset;
   double residual;
@@ -121,5 +130,34 @@ typedef struct {
   double last_update_ago;
   double remaining_time;
 } RPT_SmoothingReport;
+
+typedef struct {
+  IPAddr remote_addr;
+  IPAddr local_addr;
+  uint16_t remote_port;
+  uint8_t leap;
+  uint8_t version;
+  uint8_t mode;
+  uint8_t stratum;
+  int8_t poll;
+  int8_t precision;
+  double root_delay;
+  double root_dispersion;
+  uint32_t ref_id;
+  struct timespec ref_time;
+  double offset;
+  double peer_delay;
+  double peer_dispersion;
+  double response_time;
+  double jitter_asymmetry;
+  uint16_t tests;
+  int interleaved;
+  int authenticated;
+  char tx_tss_char;
+  char rx_tss_char;
+  uint32_t total_tx_count;
+  uint32_t total_rx_count;
+  uint32_t total_valid_count;
+} RPT_NTPReport;
 
 #endif /* GOT_REPORTS_H */

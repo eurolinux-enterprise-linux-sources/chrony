@@ -53,8 +53,12 @@ typedef uint32_t NTP_int32;
 #define NTP_MAX_EXTENSIONS_LENGTH 1024
 
 /* The minimum and maximum supported length of MAC */
-#define NTP_MIN_MAC_LENGTH 16
-#define NTP_MAX_MAC_LENGTH MAX_HASH_LENGTH
+#define NTP_MIN_MAC_LENGTH (4 + 16)
+#define NTP_MAX_MAC_LENGTH (4 + MAX_HASH_LENGTH)
+
+/* The maximum length of MAC in NTPv4 packets which allows deterministic
+   parsing of extension fields (RFC 7822) */
+#define NTP_MAX_V4_MAC_LENGTH (4 + 20)
 
 /* Type definition for leap bits */
 typedef enum {
@@ -91,7 +95,7 @@ typedef struct {
 
   /* Optional message authentication code (MAC) */
   NTP_int32 auth_keyid;
-  uint8_t auth_data[NTP_MAX_MAC_LENGTH];
+  uint8_t auth_data[NTP_MAX_MAC_LENGTH - 4];
 } NTP_Packet;
 
 #define NTP_NORMAL_PACKET_LENGTH (int)offsetof(NTP_Packet, auth_keyid)

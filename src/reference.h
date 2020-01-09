@@ -99,12 +99,12 @@ extern REF_LeapMode REF_GetLeapMode(void);
 
 extern void REF_GetReferenceParams
 (
- struct timeval *local_time,
+ struct timespec *local_time,
  int *is_synchronised,
  NTP_Leap *leap,
  int *stratum,
  uint32_t *ref_id,
- struct timeval *ref_time,
+ struct timespec *ref_time,
  double *root_delay,
  double *root_dispersion
 );
@@ -140,7 +140,7 @@ extern void REF_SetReference
  int combined_sources,
  uint32_t ref_id,
  IPAddr *ref_ip,
- struct timeval *ref_time,
+ struct timespec *ref_time,
  double offset,
  double offset_sd,
  double frequency,
@@ -151,7 +151,7 @@ extern void REF_SetReference
 
 extern void REF_SetManualReference
 (
- struct timeval *ref_time,
+ struct timespec *ref_time,
  double offset,
  double frequency,
  double skew
@@ -165,6 +165,9 @@ REF_SetUnsynchronised(void);
    synchronised */
 extern int REF_GetOurStratum(void);
 
+/* Return stratum of the local reference if orphan mode is enabled */
+extern int REF_GetOrphanStratum(void);
+
 /* Return the current skew */
 extern double REF_GetSkew(void);
 
@@ -174,9 +177,8 @@ extern void REF_ModifyMaxupdateskew(double new_max_update_skew);
 /* Modify makestep settings */
 extern void REF_ModifyMakestep(int limit, double threshold);
 
-extern void REF_EnableLocal(int stratum);
+extern void REF_EnableLocal(int stratum, double distance, int orphan);
 extern void REF_DisableLocal(void);
-extern int REF_IsLocalActive(void);
 
 /* Check if current raw or cooked time is close to a leap second
    and is better to discard any measurements */

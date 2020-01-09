@@ -42,6 +42,7 @@ typedef struct {
     uint8_t in6[16];
   } addr;
   uint16_t family;
+  uint16_t _pad;
 } IPAddr;
 
 typedef struct {
@@ -49,8 +50,11 @@ typedef struct {
   unsigned short port;
 } NTP_Remote_Address;
 
+#define INVALID_IF_INDEX -1
+
 typedef struct {
   IPAddr ip_addr;
+  int if_index;
   int sock_fd;
 } NTP_Local_Address;
 

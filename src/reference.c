@@ -3,7 +3,7 @@
 
  **********************************************************************
  * Copyright (C) Richard P. Curnow  1997-2003
- * Copyright (C) Miroslav Lichvar  2009-2015
+ * Copyright (C) Miroslav Lichvar  2009-2016
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -45,12 +45,14 @@
 static int are_we_synchronised;
 static int enable_local_stratum;
 static int local_stratum;
+static int local_orphan;
+static double local_distance;
 static NTP_Leap our_leap_status;
 static int our_leap_sec;
 static int our_stratum;
 static uint32_t our_ref_id;
 static IPAddr our_ref_ip;
-struct timeval our_ref_time;
+static struct timespec our_ref_time;
 static double our_skew;
 static double our_residual_freq;
 static double our_root_delay;
@@ -80,8 +82,7 @@ static int max_offset_delay;
 static int max_offset_ignore;
 static double max_offset;
 
-/* Flag and threshold for logging clock changes to syslog */
-static int do_log_change;
+/* Threshold for logging clock changes to syslog */
 static double log_change_threshold;
 
 /* Flag, threshold and user for sending mail notification on large clock changes */
@@ -106,7 +107,6 @@ static REF_LeapMode leap_mode;
 static int leap_in_progress;
 
 /* Timer for the leap second handler */
-static int leap_timer_running;
 static SCH_TimeoutID leap_timeout_id;
 
 /* Name of a system timezone containing leap seconds occuring at midnight */
@@ -136,7 +136,7 @@ static int next_fb_drift;
 static SCH_TimeoutID fb_drift_timeout_id;
 
 /* Timestamp of last reference update */
-static struct timeval last_ref_update;
+static struct timespec last_ref_update;
 static double last_ref_update_interval;
 
 /* ================================================== */
@@ -147,23 +147,22 @@ static void update_leap_status(NTP_Leap leap, time_t now, int reset);
 /* ================================================== */
 
 static void
-handle_slew(struct timeval *raw,
-            struct timeval *cooked,
+handle_slew(struct timespec *raw,
+            struct timespec *cooked,
             double dfreq,
             double doffset,
             LCL_ChangeType change_type,
             void *anything)
 {
   double delta;
-  struct timeval now;
+  struct timespec now;
 
-  UTI_AdjustTimeval(&our_ref_time, cooked, &our_ref_time, &delta, dfreq, doffset);
+  UTI_AdjustTimespec(&our_ref_time, cooked, &our_ref_time, &delta, dfreq, doffset);
 
   if (change_type == LCL_ChangeUnknownStep) {
-    last_ref_update.tv_sec = 0;
-    last_ref_update.tv_usec = 0;
+    UTI_ZeroTimespec(&last_ref_update);
   } else if (last_ref_update.tv_sec) {
-    UTI_AdjustTimeval(&last_ref_update, cooked, &last_ref_update, &delta, dfreq, doffset);
+    UTI_AdjustTimespec(&last_ref_update, cooked, &last_ref_update, &delta, dfreq, doffset);
   }
 
   /* When the clock was stepped, check if that doesn't change our leap status
@@ -232,9 +231,9 @@ REF_Initialise(void)
 
   correction_time_ratio = CNF_GetCorrectionTimeRatio();
 
-  enable_local_stratum = CNF_AllowLocalReference(&local_stratum);
+  enable_local_stratum = CNF_AllowLocalReference(&local_stratum, &local_orphan, &local_distance);
 
-  leap_timer_running = 0;
+  leap_timeout_id = 0;
   leap_in_progress = 0;
   leap_mode = CNF_GetLeapSecMode();
   /* Switch to step mode if the system driver doesn't support leap */
@@ -255,8 +254,8 @@ REF_Initialise(void)
 
   CNF_GetMakeStep(&make_step_limit, &make_step_threshold);
   CNF_GetMaxChange(&max_offset_delay, &max_offset_ignore, &max_offset);
-  CNF_GetLogChange(&do_log_change, &log_change_threshold);
   CNF_GetMailOnChange(&do_mail_change, &mail_change_threshold, &mail_change_user);
+  log_change_threshold = CNF_GetLogChange();
 
   CNF_GetFallbackDrifts(&fb_drift_min, &fb_drift_max);
 
@@ -264,19 +263,13 @@ REF_Initialise(void)
     fb_drifts = MallocArray(struct fb_drift, fb_drift_max - fb_drift_min + 1);
     memset(fb_drifts, 0, sizeof (struct fb_drift) * (fb_drift_max - fb_drift_min + 1));
     next_fb_drift = 0;
-    fb_drift_timeout_id = -1;
+    fb_drift_timeout_id = 0;
   }
 
-  last_ref_update.tv_sec = 0;
-  last_ref_update.tv_usec = 0;
+  UTI_ZeroTimespec(&last_ref_update);
   last_ref_update_interval = 0.0;
 
   LCL_AddParameterChangeHandler(handle_slew, NULL);
-
-  /* And just to prevent anything wierd ... */
-  if (do_log_change) {
-    log_change_threshold = fabs(log_change_threshold);
-  }
 
   /* Make first entry in tracking log */
   REF_SetUnsynchronised();
@@ -428,10 +421,8 @@ update_fb_drifts(double freq_ppm, double update_interval)
     next_fb_drift = 0;
   }
 
-  if (fb_drift_timeout_id != -1) {
-    SCH_RemoveTimeout(fb_drift_timeout_id);
-    fb_drift_timeout_id = -1;
-  }
+  SCH_RemoveTimeout(fb_drift_timeout_id);
+  fb_drift_timeout_id = 0;
 
   if (update_interval < 1.0 || update_interval > last_ref_update_interval * 4.0)
     return;
@@ -464,7 +455,7 @@ fb_drift_timeout(void *arg)
 {
   assert(next_fb_drift >= fb_drift_min && next_fb_drift <= fb_drift_max);
 
-  fb_drift_timeout_id = -1;
+  fb_drift_timeout_id = 0;
 
   DEBUG_LOG(LOGF_Reference, "Fallback drift %d active: %f ppm",
             next_fb_drift, fb_drifts[next_fb_drift - fb_drift_min].freq);
@@ -475,16 +466,16 @@ fb_drift_timeout(void *arg)
 /* ================================================== */
 
 static void
-schedule_fb_drift(struct timeval *now)
+schedule_fb_drift(struct timespec *now)
 {
   int i, c, secs;
   double unsynchronised;
-  struct timeval when;
+  struct timespec when;
 
-  if (fb_drift_timeout_id != -1)
+  if (fb_drift_timeout_id)
     return; /* already scheduled */
 
-  UTI_DiffTimevalsToDouble(&unsynchronised, now, &last_ref_update);
+  unsynchronised = UTI_DiffTimespecsToDouble(now, &last_ref_update);
 
   for (c = secs = 0, i = fb_drift_min; i <= fb_drift_max; i++) {
     secs = 1 << i;
@@ -506,7 +497,7 @@ schedule_fb_drift(struct timeval *now)
 
   if (i <= fb_drift_max) {
     next_fb_drift = i;
-    UTI_AddDoubleToTimeval(now, secs - unsynchronised, &when);
+    UTI_AddDoubleToTimespec(now, secs - unsynchronised, &when);
     fb_drift_timeout_id = SCH_AddTimeout(&when, fb_drift_timeout, NULL);
     DEBUG_LOG(LOGF_Reference, "Fallback drift %d scheduled", i);
   }
@@ -539,8 +530,7 @@ maybe_log_offset(double offset, time_t now)
 
   abs_offset = fabs(offset);
 
-  if (do_log_change &&
-      (abs_offset > log_change_threshold)) {
+  if (abs_offset > log_change_threshold) {
     LOG(LOGS_WARN, LOGF_Reference,
         "System clock wrong by %.6f seconds, adjustment started",
         -offset);
@@ -686,7 +676,7 @@ get_tz_leap(time_t when)
 static void
 leap_end_timeout(void *arg)
 {
-  leap_timer_running = 0;
+  leap_timeout_id = 0;
   leap_in_progress = 0;
   our_leap_sec = 0;
 
@@ -735,14 +725,12 @@ leap_start_timeout(void *arg)
 static void
 set_leap_timeout(time_t now)
 {
-  struct timeval when;
+  struct timespec when;
 
   /* Stop old timer if there is one */
-  if (leap_timer_running) {
-    SCH_RemoveTimeout(leap_timeout_id);
-    leap_timer_running = 0;
-    leap_in_progress = 0;
-  }
+  SCH_RemoveTimeout(leap_timeout_id);
+  leap_timeout_id = 0;
+  leap_in_progress = 0;
 
   if (!our_leap_sec)
     return;
@@ -751,16 +739,15 @@ set_leap_timeout(time_t now)
      will be corrected by the system, timeout slightly sooner to be sure it
      will happen before the system correction. */
   when.tv_sec = (now / (24 * 3600) + 1) * (24 * 3600);
-  when.tv_usec = 0;
+  when.tv_nsec = 0;
   if (our_leap_sec < 0)
     when.tv_sec--;
   if (leap_mode == REF_LeapModeSystem) {
     when.tv_sec--;
-    when.tv_usec = 500000;
+    when.tv_nsec = 500000000;
   }
 
   leap_timeout_id = SCH_AddTimeout(&when, leap_start_timeout, NULL);
-  leap_timer_running = 1;
 }
 
 /* ================================================== */
@@ -789,7 +776,7 @@ update_leap_status(NTP_Leap leap, time_t now, int reset)
     }
   }
   
-  if (reset || (leap_sec != our_leap_sec && !REF_IsLeapSecondClose())) {
+  if (leap_sec != our_leap_sec && !REF_IsLeapSecondClose()) {
     our_leap_sec = leap_sec;
 
     switch (leap_mode) {
@@ -805,6 +792,8 @@ update_leap_status(NTP_Leap leap, time_t now, int reset)
         assert(0);
         break;
     }
+  } else if (reset) {
+    set_leap_timeout(now);
   }
 
   our_leap_status = leap;
@@ -813,7 +802,7 @@ update_leap_status(NTP_Leap leap, time_t now, int reset)
 /* ================================================== */
 
 static void
-write_log(struct timeval *ref_time, char *ref, int stratum, NTP_Leap leap,
+write_log(struct timespec *ref_time, char *ref, int stratum, NTP_Leap leap,
     double freq, double skew, double offset, int combined_sources,
     double offset_sd, double uncorrected_offset)
 {
@@ -890,7 +879,7 @@ REF_SetReference(int stratum,
                  int combined_sources,
                  uint32_t ref_id,
                  IPAddr *ref_ip,
-                 struct timeval *ref_time,
+                 struct timespec *ref_time,
                  double offset,
                  double offset_sd,
                  double frequency,
@@ -911,7 +900,8 @@ REF_SetReference(int stratum,
   double elapsed;
   double correction_rate;
   double uncorrected_offset, accumulate_offset, step_offset;
-  struct timeval now, raw_now;
+  struct timespec now, raw_now;
+  NTP_int64 ref_fuzz;
 
   assert(initialised);
 
@@ -945,9 +935,9 @@ REF_SetReference(int stratum,
     
   LCL_ReadRawTime(&raw_now);
   LCL_GetOffsetCorrection(&raw_now, &uncorrected_offset, NULL);
-  UTI_AddDoubleToTimeval(&raw_now, uncorrected_offset, &now);
+  UTI_AddDoubleToTimespec(&raw_now, uncorrected_offset, &now);
 
-  UTI_DiffTimevalsToDouble(&elapsed, &now, ref_time);
+  elapsed = UTI_DiffTimespecsToDouble(&now, ref_time);
   our_offset = offset + elapsed * frequency;
 
   if (!is_offset_ok(our_offset))
@@ -965,7 +955,7 @@ REF_SetReference(int stratum,
   our_root_dispersion = root_dispersion;
 
   if (last_ref_update.tv_sec) {
-    UTI_DiffTimevalsToDouble(&update_interval, &now, &last_ref_update);
+    update_interval = UTI_DiffTimespecsToDouble(&now, &last_ref_update);
     if (update_interval < 0.0)
       update_interval = 0.0;
   } else {
@@ -1052,6 +1042,15 @@ REF_SetReference(int stratum,
 
   LCL_SetSyncStatus(are_we_synchronised, offset_sd, offset_sd + root_delay / 2.0 + root_dispersion);
 
+  /* Add a random error of up to one second to the reference time to make it
+     less useful when disclosed to NTP and cmdmon clients for estimating
+     receive timestamps in the interleaved symmetric NTP mode */
+  UTI_GetNtp64Fuzz(&ref_fuzz, 0);
+  UTI_TimespecToNtp64(&our_ref_time, &ref_fuzz, &ref_fuzz);
+  UTI_Ntp64ToTimespec(&ref_fuzz, &our_ref_time);
+  if (UTI_CompareTimespecs(&our_ref_time, ref_time) >= 0)
+    our_ref_time.tv_sec--;
+
   abs_freq_ppm = LCL_ReadAbsoluteFrequency();
 
   write_log(&now,
@@ -1098,7 +1097,7 @@ REF_SetReference(int stratum,
 void
 REF_SetManualReference
 (
- struct timeval *ref_time,
+ struct timespec *ref_time,
  double offset,
  double frequency,
  double skew
@@ -1117,7 +1116,7 @@ void
 REF_SetUnsynchronised(void)
 {
   /* Variables required for logging to statistics log */
-  struct timeval now, now_raw;
+  struct timespec now, now_raw;
   double uncorrected_offset;
 
   assert(initialised);
@@ -1130,7 +1129,7 @@ REF_SetUnsynchronised(void)
 
   LCL_ReadRawTime(&now_raw);
   LCL_GetOffsetCorrection(&now_raw, &uncorrected_offset, NULL);
-  UTI_AddDoubleToTimeval(&now_raw, uncorrected_offset, &now);
+  UTI_AddDoubleToTimespec(&now_raw, uncorrected_offset, &now);
 
   if (fb_drifts) {
     schedule_fb_drift(&now);
@@ -1158,39 +1157,47 @@ REF_SetUnsynchronised(void)
 void
 REF_GetReferenceParams
 (
- struct timeval *local_time,
+ struct timespec *local_time,
  int *is_synchronised,
  NTP_Leap *leap_status,
  int *stratum,
  uint32_t *ref_id,
- struct timeval *ref_time,
+ struct timespec *ref_time,
  double *root_delay,
  double *root_dispersion
 )
 {
-  double elapsed;
-  double extra_dispersion;
+  double elapsed, dispersion;
 
   assert(initialised);
 
   if (are_we_synchronised) {
+    elapsed = UTI_DiffTimespecsToDouble(local_time, &our_ref_time);
+    dispersion = our_root_dispersion +
+      (our_skew + fabs(our_residual_freq) + LCL_GetMaxClockError()) * elapsed;
+  } else {
+    dispersion = 0.0;
+  }
+
+  /* Local reference is active when enabled and the clock is not synchronised
+     or the root distance exceeds the threshold */
+
+  if (are_we_synchronised &&
+      !(enable_local_stratum && our_root_delay / 2 + dispersion > local_distance)) {
 
     *is_synchronised = 1;
 
     *stratum = our_stratum;
 
-    UTI_DiffTimevalsToDouble(&elapsed, local_time, &our_ref_time);
-    extra_dispersion = (our_skew + fabs(our_residual_freq) + LCL_GetMaxClockError()) * elapsed;
-
     *leap_status = !leap_in_progress ? our_leap_status : LEAP_Unsynchronised;
     *ref_id = our_ref_id;
     *ref_time = our_ref_time;
     *root_delay = our_root_delay;
-    *root_dispersion = our_root_dispersion + extra_dispersion;
+    *root_dispersion = dispersion;
 
   } else if (enable_local_stratum) {
 
-    *is_synchronised = 1;
+    *is_synchronised = 0;
 
     *stratum = local_stratum;
     *ref_id = NTP_REFID_LOCAL;
@@ -1207,7 +1214,7 @@ REF_GetReferenceParams
     *leap_status = LEAP_Normal;
     
     *root_delay = 0.0;
-    *root_dispersion = LCL_GetSysPrecisionAsQuantum();
+    *root_dispersion = 0.0;
     
   } else {
 
@@ -1216,7 +1223,7 @@ REF_GetReferenceParams
     *leap_status = LEAP_Unsynchronised;
     *stratum = NTP_MAX_STRATUM;
     *ref_id = NTP_REFID_UNSYNC;
-    ref_time->tv_sec = ref_time->tv_usec = 0;
+    UTI_ZeroTimespec(ref_time);
     /* These values seem to be standard for a client, and
        any peer or client of ours will ignore them anyway because
        we don't claim to be synchronised */
@@ -1231,13 +1238,27 @@ REF_GetReferenceParams
 int
 REF_GetOurStratum(void)
 {
-  if (are_we_synchronised) {
-    return our_stratum;
-  } else if (enable_local_stratum) {
-    return local_stratum;
-  } else {
+  struct timespec now_cooked, ref_time;
+  int synchronised, stratum;
+  NTP_Leap leap_status;
+  uint32_t ref_id;
+  double root_delay, root_dispersion;
+
+  SCH_GetLastEventTime(&now_cooked, NULL, NULL);
+  REF_GetReferenceParams(&now_cooked, &synchronised, &leap_status, &stratum,
+                         &ref_id, &ref_time, &root_delay, &root_dispersion);
+
+  return stratum;
+}
+
+/* ================================================== */
+
+int
+REF_GetOrphanStratum(void)
+{
+  if (!enable_local_stratum || !local_orphan || mode != REF_ModeNormal)
     return NTP_MAX_STRATUM;
-  }
+  return local_stratum;
 }
 
 /* ================================================== */
@@ -1268,10 +1289,12 @@ REF_ModifyMakestep(int limit, double threshold)
 /* ================================================== */
 
 void
-REF_EnableLocal(int stratum)
+REF_EnableLocal(int stratum, double distance, int orphan)
 {
   enable_local_stratum = 1;
-  local_stratum = stratum;
+  local_stratum = CLAMP(1, stratum, NTP_MAX_STRATUM - 1);
+  local_distance = distance;
+  local_orphan = !!orphan;
 }
 
 /* ================================================== */
@@ -1284,19 +1307,11 @@ REF_DisableLocal(void)
 
 /* ================================================== */
 
-int
-REF_IsLocalActive(void)
-{
-  return !are_we_synchronised && enable_local_stratum;
-}
-
-/* ================================================== */
-
 #define LEAP_SECOND_CLOSE 5
 
 int REF_IsLeapSecondClose(void)
 {
-  struct timeval now, now_raw;
+  struct timespec now, now_raw;
   time_t t;
 
   if (!our_leap_sec)
@@ -1320,52 +1335,34 @@ int REF_IsLeapSecondClose(void)
 void
 REF_GetTrackingReport(RPT_TrackingReport *rep)
 {
-  double elapsed;
-  double extra_dispersion;
-  struct timeval now_raw, now_cooked;
+  struct timespec now_raw, now_cooked;
   double correction;
+  int synchronised;
 
   LCL_ReadRawTime(&now_raw);
   LCL_GetOffsetCorrection(&now_raw, &correction, NULL);
-  UTI_AddDoubleToTimeval(&now_raw, correction, &now_cooked);
+  UTI_AddDoubleToTimespec(&now_raw, correction, &now_cooked);
 
-  rep->ref_id = NTP_REFID_UNSYNC;
+  REF_GetReferenceParams(&now_cooked, &synchronised,
+                         &rep->leap_status, &rep->stratum,
+                         &rep->ref_id, &rep->ref_time,
+                         &rep->root_delay, &rep->root_dispersion);
+
+  if (rep->stratum == NTP_MAX_STRATUM)
+    rep->stratum = 0;
+
   rep->ip_addr.family = IPADDR_UNSPEC;
-  rep->stratum = 0;
-  rep->leap_status = our_leap_status;
-  rep->ref_time.tv_sec = 0;
-  rep->ref_time.tv_usec = 0;
   rep->current_correction = correction;
   rep->freq_ppm = LCL_ReadAbsoluteFrequency();
   rep->resid_freq_ppm = 0.0;
   rep->skew_ppm = 0.0;
-  rep->root_delay = 0.0;
-  rep->root_dispersion = 0.0;
   rep->last_update_interval = last_ref_update_interval;
   rep->last_offset = last_offset;
   rep->rms_offset = sqrt(avg2_offset);
 
-  if (are_we_synchronised) {
-    
-    UTI_DiffTimevalsToDouble(&elapsed, &now_cooked, &our_ref_time);
-    extra_dispersion = (our_skew + fabs(our_residual_freq) + LCL_GetMaxClockError()) * elapsed;
-    
-    rep->ref_id = our_ref_id;
+  if (synchronised) {
     rep->ip_addr = our_ref_ip;
-    rep->stratum = our_stratum;
-    rep->ref_time = our_ref_time;
     rep->resid_freq_ppm = 1.0e6 * our_residual_freq;
     rep->skew_ppm = 1.0e6 * our_skew;
-    rep->root_delay = our_root_delay;
-    rep->root_dispersion = our_root_dispersion + extra_dispersion;
-
-  } else if (enable_local_stratum) {
-
-    rep->ref_id = NTP_REFID_LOCAL;
-    rep->ip_addr.family = IPADDR_UNSPEC;
-    rep->stratum = local_stratum;
-    rep->ref_time = now_cooked;
-    rep->root_dispersion = LCL_GetSysPrecisionAsQuantum();
   }
-
 }

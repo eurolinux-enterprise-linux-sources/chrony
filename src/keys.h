@@ -34,15 +34,15 @@ extern void KEY_Finalise(void);
 
 extern void KEY_Reload(void);
 
-extern uint32_t KEY_GetCommandKey(void);
-
 extern int KEY_GetKey(uint32_t key_id, char **key, int *len);
 extern int KEY_KeyKnown(uint32_t key_id);
 extern int KEY_GetAuthDelay(uint32_t key_id);
+extern int KEY_GetAuthLength(uint32_t key_id);
+extern int KEY_CheckKeyLength(uint32_t key_id);
 
 extern int KEY_GenerateAuth(uint32_t key_id, const unsigned char *data,
     int data_len, unsigned char *auth, int auth_len);
-extern int KEY_CheckAuth(uint32_t key_id, const unsigned char *data,
-    int data_len, const unsigned char *auth, int auth_len);
+extern int KEY_CheckAuth(uint32_t key_id, const unsigned char *data, int data_len,
+                         const unsigned char *auth, int auth_len, int trunc_len);
 
 #endif /* GOT_KEYS_H */

@@ -5,33 +5,28 @@ pool pool.ntp.org iburst
 # Record the rate at which the system clock gains/losses time.
 driftfile /var/lib/chrony/drift
 
-# In first three updates step the system clock instead of slew
-# if the adjustment is larger than 10 seconds.
-makestep 10 3
+# Allow the system clock to be stepped in the first three updates
+# if its offset is larger than 1 second.
+makestep 1.0 3
 
 # Enable kernel synchronization of the real-time clock (RTC).
 rtcsync
 
-# Allow NTP client access from local network.
-#allow 192.168/16
+# Enable hardware timestamping on all interfaces that support it.
+#hwtimestamp *
 
-# Serve time even if not synchronized to any NTP server.
+# Increase the minimum number of selectable sources required to adjust
+# the system clock.
+#minsources 2
+
+# Allow NTP client access from local network.
+#allow 192.168.0.0/16
+
+# Serve time even if not synchronized to a time source.
 #local stratum 10
 
-# Specify file containing keys for NTP and command authentication.
-keyfile /etc/chrony.keys
-
-# Specify key number for command authentication.
-commandkey 1
-
-# Generate new command key on start if missing.
-generatecommandkey
-
-# Disable logging of client accesses.
-noclientlog
-
-# Send message to syslog when clock adjustment is larger than 0.5 seconds.
-logchange 0.5
+# Specify file containing keys for NTP authentication.
+#keyfile /etc/chrony.keys
 
 # Specify directory for log files.
 logdir /var/log/chrony

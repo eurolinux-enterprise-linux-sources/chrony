@@ -1,3 +1,156 @@
+New in version 3.1
+==================
+
+Enhancements
+------------
+* Add support for precise cross timestamping of PHC on Linux
+* Add minpoll, precision, nocrossts options to hwtimestamp directive
+* Add rawmeasurements option to log directive and modify measurements
+  option to log only valid measurements from synchronised sources
+* Allow sub-second polling interval with NTP sources
+
+Bug fixes
+---------
+* Fix time smoothing in interleaved mode
+
+New in version 3.0
+==================
+
+Enhancements
+------------
+* Add support for software and hardware timestamping on Linux
+* Add support for client/server and symmetric interleaved modes
+* Add support for MS-SNTP authentication in Samba
+* Add support for truncated MACs in NTPv4 packets
+* Estimate and correct for asymmetric network jitter
+* Increase default minsamples and polltarget to improve stability
+  with very low jitter
+* Add maxjitter directive to limit source selection by jitter
+* Add offset option to server/pool/peer directive
+* Add maxlockage option to refclock directive
+* Add -t option to chronyd to exit after specified time
+* Add partial protection against replay attacks on symmetric mode
+* Don't reset polling interval when switching sources to online state
+* Allow rate limiting with very short intervals
+* Improve maximum server throughput on Linux and NetBSD
+* Remove dump files after start
+* Add tab-completion to chronyc with libedit/readline
+* Add ntpdata command to print details about NTP measurements
+* Allow all source options to be set in add server/peer command
+* Indicate truncated addresses/hostnames in chronyc output
+* Print reference IDs as hexadecimal numbers to avoid confusion with
+  IPv4 addresses
+
+Bug fixes
+---------
+* Fix crash with disabled asynchronous name resolving
+
+New in version 2.4.1
+====================
+
+Bug fixes
+---------
+* Fix processing of kernel timestamps on non-Linux systems
+* Fix crash with smoothtime directive
+* Fix validation of refclock sample times
+* Fix parsing of refclock directive
+
+New in version 2.4
+==================
+
+Enhancements
+------------
+* Add orphan option to local directive for orphan mode compatible with ntpd
+* Add distance option to local directive to set activation threshold
+  (1 second by default)
+* Add maxdrift directive to set maximum allowed drift of system clock
+* Try to replace NTP sources exceeding maximum distance
+* Randomise source replacement to avoid getting stuck with bad sources
+* Randomise selection of sources from pools on start
+* Ignore reference timestamp as ntpd doesn't always set it correctly
+* Modify tracking report to use same values as seen by NTP clients
+* Add -c option to chronyc to write reports in CSV format
+* Provide detailed manual pages
+
+Bug fixes
+---------
+* Fix SOCK refclock to work correctly when not specified as last refclock
+* Fix initstepslew and -q/-Q options to accept time from own NTP clients
+* Fix authentication with keys using 512-bit hash functions
+* Fix crash on exit when multiple signals are received
+* Fix conversion of very small floating-point numbers in command packets
+
+Removed features
+----------------
+* Drop documentation in Texinfo format
+
+New in version 2.3
+==================
+
+Enhancements
+------------
+* Add support for NTP and command response rate limiting
+* Add support for dropping root privileges on Mac OS X, FreeBSD, Solaris
+* Add require and trust options for source selection
+* Enable logchange by default (1 second threshold)
+* Set RTC on Mac OS X with rtcsync directive
+* Allow binding to NTP port after dropping root privileges on NetBSD
+* Drop CAP_NET_BIND_SERVICE capability on Linux when NTP port is disabled
+* Resolve names in separate process when seccomp filter is enabled
+* Replace old records in client log when memory limit is reached
+* Don't reveal local time and synchronisation state in client packets
+* Don't keep client sockets open for longer than necessary
+* Ignore poll in KoD RATE packets as ntpd doesn't always set it correctly
+* Warn when using keys shorter than 80 bits
+* Add keygen command to generate random keys easily
+* Add serverstats command to report NTP and command packet statistics
+
+Bug fixes
+---------
+* Fix clock correction after making step on Mac OS X
+* Fix building on Solaris
+
+New in version 2.2.1
+====================
+
+Security fixes
+--------------
+* Restrict authentication of NTP server/peer to specified key (CVE-2016-1567)
+
+New in version 2.2
+==================
+
+Enhancements
+------------
+* Add support for configuration and monitoring over Unix domain socket
+  (accessible by root or chrony user when root privileges are dropped)
+* Add support for system call filtering with seccomp on Linux (experimental)
+* Add support for dropping root privileges on NetBSD
+* Control frequency of system clock on FreeBSD, NetBSD, Solaris
+* Add system leap second handling mode on FreeBSD, NetBSD, Solaris
+* Add dynamic drift removal on Mac OS X
+* Add support for setting real-time priority on Mac OS X
+* Add maxdistance directive to limit source selection by root distance
+  (3 seconds by default)
+* Add refresh command to get new addresses of NTP sources
+* Allow wildcard patterns in include directive
+* Restore time from driftfile with -s option if later than RTC time
+* Add configure option to set default hwclockfile
+* Add -d option to chronyc to enable debug messages
+* Allow multiple addresses to be specified for chronyc with -h option
+  and reconnect when no valid reply is received
+* Make check interval in waitsync command configurable
+
+Bug fixes
+---------
+* Fix building on NetBSD, Solaris
+* Restore time from driftfile with -s option if reading RTC failed
+
+Removed features
+----------------
+* Drop support for authentication with command key (run-time configuration
+  is now allowed only for local users that can access the Unix domain socket)
+
 New in version 2.1.1
 ====================
 

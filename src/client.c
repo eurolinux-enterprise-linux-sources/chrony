@@ -3,7 +3,8 @@
 
  **********************************************************************
  * Copyright (C) Richard P. Curnow  1997-2003
- * Copyright (C) Miroslav Lichvar  2009-2015
+ * Copyright (C) Lonnie Abelbeck  2016
+ * Copyright (C) Miroslav Lichvar  2009-2016
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -30,9 +31,11 @@
 
 #include "sysincl.h"
 
+#include "array.h"
 #include "candm.h"
+#include "logging.h"
+#include "memory.h"
 #include "nameserv.h"
-#include "hash.h"
 #include "getdate.h"
 #include "cmdparse.h"
 #include "pktlength.h"
@@ -49,27 +52,54 @@
 
 /* ================================================== */
 
-union sockaddr_in46 {
+union sockaddr_all {
   struct sockaddr_in in4;
 #ifdef FEAT_IPV6
   struct sockaddr_in6 in6;
 #endif
-  struct sockaddr u;
+  struct sockaddr_un un;
+  struct sockaddr sa;
 };
 
-static int sock_fd;
-union sockaddr_in46 his_addr;
-static socklen_t his_addr_len;
+static ARR_Instance sockaddrs;
+
+static int sock_fd = -1;
+
+static int quit = 0;
 
 static int on_terminal = 0;
 
 static int no_dns = 0;
 
-static int recv_errqueue = 0;
+static int csv_mode = 0;
 
 /* ================================================== */
-/* Read a single line of commands from standard input.  Eventually we
-   might want to use the GNU readline library. */
+/* Log a message. This is a minimalistic replacement of the logging.c
+   implementation to avoid linking with it and other modules. */
+
+int log_debug_enabled = 0;
+
+void LOG_Message(LOG_Severity severity,
+#if DEBUG > 0
+                 LOG_Facility facility, int line_number,
+                 const char *filename, const char *function_name,
+#endif
+                 const char *format, ...)
+{
+  va_list ap;
+
+  va_start(ap, format);
+  vfprintf(stderr, format, ap);
+  putc('\n', stderr);
+  va_end(ap);
+}
+
+/* ================================================== */
+/* Read a single line of commands from standard input */
+
+#ifdef FEAT_READLINE
+static char **command_name_completion(const char *text, int start, int end);
+#endif
 
 static char *
 read_line(void)
@@ -81,6 +111,9 @@ read_line(void)
 #ifdef FEAT_READLINE
     char *cmd;
 
+    rl_attempted_completion_function = command_name_completion;
+    rl_basic_word_break_characters = "\t\n\r";
+
     /* save line only if not empty */
     cmd = readline(prompt);
     if( cmd == NULL ) return( NULL );
@@ -91,7 +124,7 @@ read_line(void)
       line[sizeof(line) - 1] = '\0';
       add_history(cmd);
       /* free the buffer allocated by readline */
-      free(cmd);
+      Free(cmd);
     } else {
       /* simulate the user has entered an empty line */
       *line = '\0';
@@ -99,6 +132,7 @@ read_line(void)
     return( line );
 #else
     printf("%s", prompt);
+    fflush(stdout);
 #endif
   }
   if (fgets(line, sizeof(line), stdin)) {
@@ -110,55 +144,116 @@ read_line(void)
 }
 
 /* ================================================== */
-/* Initialise the socket used to talk to the daemon */
 
-static void
-open_io(const char *hostname, int port)
+static ARR_Instance
+get_sockaddrs(const char *hostnames, int port)
 {
-  IPAddr ip;
-  int on_off = 1;
+  ARR_Instance addrs;
+  char *hostname, *s1, *s2;
+  IPAddr ip_addrs[DNS_MAX_ADDRESSES];
+  union sockaddr_all *addr;
+  int i;
 
-  /* Note, this call could block for a while */
-  if (DNS_Name2IPAddress(hostname, &ip, 1) != DNS_Success) {
-    fprintf(stderr, "Could not get IP address for %s\n", hostname);
-    exit(1);
+  addrs = ARR_CreateInstance(sizeof (union sockaddr_all));
+  s1 = Strdup(hostnames);
+
+  /* Parse the comma-separated list of hostnames */
+  for (hostname = s1; hostname && *hostname; hostname = s2) {
+    s2 = strchr(hostname, ',');
+    if (s2)
+      *s2++ = '\0';
+
+    /* hostname starting with / is considered a path of Unix domain socket */
+    if (hostname[0] == '/') {
+      addr = (union sockaddr_all *)ARR_GetNewElement(addrs);
+      if (snprintf(addr->un.sun_path, sizeof (addr->un.sun_path), "%s", hostname) >=
+          sizeof (addr->un.sun_path))
+        LOG_FATAL(LOGF_Client, "Unix socket path too long");
+      addr->un.sun_family = AF_UNIX;
+    } else {
+      if (DNS_Name2IPAddress(hostname, ip_addrs, DNS_MAX_ADDRESSES) != DNS_Success) {
+        DEBUG_LOG(LOGF_Client, "Could not get IP address for %s", hostname);
+        break;
+      }
+
+      for (i = 0; i < DNS_MAX_ADDRESSES && ip_addrs[i].family != IPADDR_UNSPEC; i++) {
+        addr = (union sockaddr_all *)ARR_GetNewElement(addrs);
+        UTI_IPAndPortToSockaddr(&ip_addrs[i], port, (struct sockaddr *)addr);
+        DEBUG_LOG(LOGF_Client, "Resolved %s to %s", hostname, UTI_IPToString(&ip_addrs[i]));
+      }
+    }
   }
 
-  switch (ip.family) {
-    case IPADDR_INET4:
-      sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  Free(s1);
+  return addrs;
+}
+
+/* ================================================== */
+/* Initialise the socket used to talk to the daemon */
+
+static int
+prepare_socket(union sockaddr_all *addr)
+{
+  socklen_t addr_len;
+  char *dir;
+
+  switch (addr->sa.sa_family) {
+    case AF_UNIX:
+      addr_len = sizeof (addr->un);
+      break;
+    case AF_INET:
+      addr_len = sizeof (addr->in4);
       break;
 #ifdef FEAT_IPV6
-    case IPADDR_INET6:
-      sock_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    case AF_INET6:
+      addr_len = sizeof (addr->in6);
       break;
 #endif
     default:
       assert(0);
   }
 
-  his_addr_len = UTI_IPAndPortToSockaddr(&ip, port, &his_addr.u);
+  sock_fd = socket(addr->sa.sa_family, SOCK_DGRAM, 0);
 
   if (sock_fd < 0) {
-    perror("Can't create socket");
-    exit(1);
+    DEBUG_LOG(LOGF_Client, "Could not create socket : %s", strerror(errno));
+    return 0;
   }
 
-  /* Enable extended error reporting (e.g. ECONNREFUSED on ICMP unreachable) */
-#ifdef IP_RECVERR
-  if (ip.family == IPADDR_INET4 &&
-      !setsockopt(sock_fd, IPPROTO_IP, IP_RECVERR, &on_off, sizeof(on_off))) {
-    recv_errqueue = 1;
+  if (addr->sa.sa_family == AF_UNIX) {
+    struct sockaddr_un sa_un;
+
+    /* Construct path of our socket.  Use the same directory as the server
+       socket and include our process ID to allow multiple chronyc instances
+       running at the same time. */
+    dir = UTI_PathToDir(addr->un.sun_path);
+    if (snprintf(sa_un.sun_path, sizeof (sa_un.sun_path),
+                 "%s/chronyc.%d.sock", dir, (int)getpid()) >= sizeof (sa_un.sun_path))
+      LOG_FATAL(LOGF_Client, "Unix socket path too long");
+    Free(dir);
+
+    sa_un.sun_family = AF_UNIX;
+    unlink(sa_un.sun_path);
+
+    /* Bind the socket to the path */
+    if (bind(sock_fd, (struct sockaddr *)&sa_un, sizeof (sa_un)) < 0) {
+      DEBUG_LOG(LOGF_Client, "Could not bind socket : %s", strerror(errno));
+      return 0;
+    }
+
+    /* Allow server without root privileges to send replies to our socket */
+    if (chmod(sa_un.sun_path, 0666) < 0) {
+      DEBUG_LOG(LOGF_Client, "Could not change socket permissions : %s", strerror(errno));
+      return 0;
+    }
   }
-#endif
-#ifdef FEAT_IPV6
-#ifdef IPV6_RECVERR
-  if (ip.family == IPADDR_INET6 &&
-      !setsockopt(sock_fd, IPPROTO_IPV6, IPV6_RECVERR, &on_off, sizeof(on_off))) {
-    recv_errqueue = 1;
+
+  if (connect(sock_fd, &addr->sa, addr_len) < 0) {
+    DEBUG_LOG(LOGF_Client, "Could not connect socket : %s", strerror(errno));
+    return 0;
   }
-#endif
-#endif
+
+  return 1;
 }
 
 /* ================================================== */
@@ -166,9 +261,50 @@ open_io(const char *hostname, int port)
 static void
 close_io(void)
 {
+  union sockaddr_all addr;
+  socklen_t addr_len = sizeof (addr);
+
+  if (sock_fd < 0)
+    return;
+
+  /* Remove our Unix domain socket */
+  if (getsockname(sock_fd, &addr.sa, &addr_len) < 0)
+    LOG_FATAL(LOGF_Client, "getsockname() failed : %s", strerror(errno));
+  if (addr_len <= sizeof (addr) && addr_len > sizeof (addr.sa.sa_family) &&
+      addr.sa.sa_family == AF_UNIX)
+    unlink(addr.un.sun_path);
 
   close(sock_fd);
+  sock_fd = -1;
+}
 
+/* ================================================== */
+
+static int
+open_io(void)
+{
+  static unsigned int address_index = 0;
+  union sockaddr_all *addr;
+
+  /* If a socket is already opened, close it and try the next address */
+  if (sock_fd >= 0) {
+    close_io();
+    address_index++;
+  }
+
+  /* Find an address for which a socket can be opened and connected */
+  for (; address_index < ARR_GetSize(sockaddrs); address_index++) {
+    addr = (union sockaddr_all *)ARR_GetElement(sockaddrs, address_index);
+    DEBUG_LOG(LOGF_Client, "Opening connection to %s",
+              UTI_SockaddrToString(&addr->sa));
+
+    if (prepare_socket(addr))
+      return 1;
+
+    close_io();
+  }
+
+  return 0;
 }
 
 /* ================================================== */
@@ -237,13 +373,13 @@ read_mask_address(char *line, IPAddr *mask, IPAddr *address)
         bits_to_mask(-1, address->family, mask);
         return 1;
       } else {
-        fprintf(stderr, "Could not get address for hostname\n");
+        LOG(LOGS_ERR, LOGF_Client, "Could not get address for hostname");
         return 0;
       }
     }
   }
 
-  fprintf(stderr, "Invalid syntax for mask/address\n");
+  LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for mask/address");
   return 0;
 }
 
@@ -302,11 +438,11 @@ read_address_integer(char *line, IPAddr *address, int *value)
   line = CPS_SplitWord(line);
 
   if (sscanf(line, "%d", value) != 1) {
-    fprintf(stderr, "Invalid syntax for address value\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for address value");
     ok = 0;
   } else {
     if (DNS_Name2IPAddress(hostname, address, 1) != DNS_Success) {
-      fprintf(stderr, "Could not get address for hostname\n");
+      LOG(LOGS_ERR, LOGF_Client, "Could not get address for hostname");
       ok = 0;
     } else {
       ok = 1;
@@ -330,11 +466,11 @@ read_address_double(char *line, IPAddr *address, double *value)
   line = CPS_SplitWord(line);
 
   if (sscanf(line, "%lf", value) != 1) {
-    fprintf(stderr, "Invalid syntax for address value\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for address value");
     ok = 0;
   } else {
     if (DNS_Name2IPAddress(hostname, address, 1) != DNS_Success) {
-      fprintf(stderr, "Could not get address for hostname\n");
+      LOG(LOGS_ERR, LOGF_Client, "Could not get address for hostname");
       ok = 0;
     } else {
       ok = 1;
@@ -567,7 +703,7 @@ process_cmd_burst(CMD_Request *msg, char *line)
   CPS_SplitWord(s2);
 
   if (sscanf(s1, "%d/%d", &n_good_samples, &n_total_samples) != 2) {
-    fprintf(stderr, "Invalid syntax for burst command\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for burst command");
     return 0;
   }
 
@@ -589,25 +725,26 @@ process_cmd_burst(CMD_Request *msg, char *line)
 /* ================================================== */
 
 static int
-process_cmd_local(CMD_Request *msg, const char *line)
+process_cmd_local(CMD_Request *msg, char *line)
 {
-  const char *p;
-  int stratum;
+  int on_off, stratum = 0, orphan = 0;
+  double distance = 0.0;
 
-  p = line;
-  
-  if (!strcmp(p, "off")) {
-    msg->data.local.on_off = htonl(0);
-    msg->data.local.stratum = htonl(0);
-  } else if (sscanf(p, "stratum%d", &stratum) == 1) {
-    msg->data.local.on_off = htonl(1);
-    msg->data.local.stratum = htonl(stratum);
+  if (!strcmp(line, "off")) {
+    on_off = 0;
+  } else if (CPS_ParseLocal(line, &stratum, &orphan, &distance)) {
+    on_off = 1;
   } else {
-    fprintf(stderr, "Invalid syntax for local command\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for local command");
     return 0;
   }
 
-  msg->command = htons(REQ_LOCAL);
+  msg->command = htons(REQ_LOCAL2);
+  msg->data.local.on_off = htonl(on_off);
+  msg->data.local.stratum = htonl(stratum);
+  msg->data.local.distance = UTI_FloatHostToNetwork(distance);
+  msg->data.local.orphan = htonl(orphan);
+
   return 1;
 }
 
@@ -627,7 +764,7 @@ process_cmd_manual(CMD_Request *msg, const char *line)
   } else if (!strcmp(p, "reset")) {
     msg->data.manual.option = htonl(2);
   } else {
-    fprintf(stderr, "Invalid syntax for manual command\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for manual command");
     return 0;
   }
   msg->command = htons(REQ_MANUAL);
@@ -662,7 +799,7 @@ parse_allow_deny(CMD_Request *msg, char *line)
 
       /* Try to parse as the name of a machine */
       if (DNS_Name2IPAddress(p, &ip, 1) != DNS_Success) {
-        fprintf(stderr, "Could not read address\n");
+        LOG(LOGS_ERR, LOGF_Client, "Could not read address");
         return 0;
       } else {
         UTI_IPHostToNetwork(&ip, &msg->data.allow_deny.ip);
@@ -715,7 +852,8 @@ parse_allow_deny(CMD_Request *msg, char *line)
         if (n == 1) {
           msg->data.allow_deny.subnet_bits = htonl(specified_subnet_bits);
         } else {
-          fprintf(stderr, "Warning: badly formatted subnet size, using %ld\n", (long) ntohl(msg->data.allow_deny.subnet_bits));
+          LOG(LOGS_WARN, LOGF_Client, "Warning: badly formatted subnet size, using %d",
+              (int)ntohl(msg->data.allow_deny.subnet_bits));
         }
       } 
     }
@@ -849,7 +987,7 @@ process_cmd_accheck(CMD_Request *msg, char *line)
     UTI_IPHostToNetwork(&ip, &msg->data.ac_check.ip);
     return 1;
   } else {    
-    fprintf(stderr, "Could not read address\n");
+    LOG(LOGS_ERR, LOGF_Client, "Could not read address");
     return 0;
   }
 }
@@ -865,7 +1003,7 @@ process_cmd_cmdaccheck(CMD_Request *msg, char *line)
     UTI_IPHostToNetwork(&ip, &msg->data.ac_check.ip);
     return 1;
   } else {    
-    fprintf(stderr, "Could not read address\n");
+    LOG(LOGS_ERR, LOGF_Client, "Could not read address");
     return 0;
   }
 }
@@ -928,51 +1066,24 @@ static int
 process_cmd_add_server_or_peer(CMD_Request *msg, char *line)
 {
   CPS_NTP_Source data;
-  CPS_Status status;
   IPAddr ip_addr;
-  char str[64];
-  int result = 0;
+  int result = 0, status;
+  const char *opt_name;
   
   status = CPS_ParseNTPSourceAdd(line, &data);
   switch (status) {
-    case CPS_Success:
+    case 0:
+      LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for add command");
+      break;
+    default:
       if (DNS_Name2IPAddress(data.name, &ip_addr, 1) != DNS_Success) {
-        fprintf(stderr, "Invalid host/IP address\n");
+        LOG(LOGS_ERR, LOGF_Client, "Invalid host/IP address");
         break;
       }
 
-      if (data.params.min_stratum != SRC_DEFAULT_MINSTRATUM) {
-        fprintf(stderr, "Option minstratum not supported\n");
-        break;
-      }
-
-      if (data.params.poll_target != SRC_DEFAULT_POLLTARGET) {
-        fprintf(stderr, "Option polltarget not supported\n");
-        break;
-      }
-
-      if (data.params.max_delay_dev_ratio != SRC_DEFAULT_MAXDELAYDEVRATIO) {
-        fprintf(stderr, "Option maxdelaydevratio not supported\n");
-        break;
-      }
-
-      if (data.params.version != NTP_VERSION) {
-        fprintf(stderr, "Option version not supported\n");
-        break;
-      }
-
-      if (data.params.max_sources != SRC_DEFAULT_MAXSOURCES) {
-        fprintf(stderr, "Option maxsources not supported\n");
-        break;
-      }
-
-      if (data.params.min_samples != SRC_DEFAULT_MINSAMPLES) {
-        fprintf(stderr, "Option minsamples not supported\n");
-        break;
-      }
-
-      if (data.params.max_samples != SRC_DEFAULT_MAXSAMPLES) {
-        fprintf(stderr, "Option maxsamples not supported\n");
+      opt_name = NULL;
+      if (opt_name) {
+        LOG(LOGS_ERR, LOGF_Client, "%s can't be set in chronyc", opt_name);
         break;
       }
 
@@ -981,21 +1092,29 @@ process_cmd_add_server_or_peer(CMD_Request *msg, char *line)
       msg->data.ntp_source.minpoll = htonl(data.params.minpoll);
       msg->data.ntp_source.maxpoll = htonl(data.params.maxpoll);
       msg->data.ntp_source.presend_minpoll = htonl(data.params.presend_minpoll);
+      msg->data.ntp_source.min_stratum = htonl(data.params.min_stratum);
+      msg->data.ntp_source.poll_target = htonl(data.params.poll_target);
+      msg->data.ntp_source.version = htonl(data.params.version);
+      msg->data.ntp_source.max_sources = htonl(data.params.max_sources);
+      msg->data.ntp_source.min_samples = htonl(data.params.min_samples);
+      msg->data.ntp_source.max_samples = htonl(data.params.max_samples);
       msg->data.ntp_source.authkey = htonl(data.params.authkey);
       msg->data.ntp_source.max_delay = UTI_FloatHostToNetwork(data.params.max_delay);
       msg->data.ntp_source.max_delay_ratio = UTI_FloatHostToNetwork(data.params.max_delay_ratio);
+      msg->data.ntp_source.max_delay_dev_ratio =
+        UTI_FloatHostToNetwork(data.params.max_delay_dev_ratio);
+      msg->data.ntp_source.offset = UTI_FloatHostToNetwork(data.params.offset);
       msg->data.ntp_source.flags = htonl(
           (data.params.online ? REQ_ADDSRC_ONLINE : 0) |
           (data.params.auto_offline ? REQ_ADDSRC_AUTOOFFLINE : 0) |
           (data.params.iburst ? REQ_ADDSRC_IBURST : 0) |
-          (data.params.sel_option == SRC_SelectPrefer ? REQ_ADDSRC_PREFER : 0) |
-          (data.params.sel_option == SRC_SelectNoselect ? REQ_ADDSRC_NOSELECT : 0));
+          (data.params.interleaved ? REQ_ADDSRC_INTERLEAVED : 0) |
+          (data.params.sel_options & SRC_SELECT_PREFER ? REQ_ADDSRC_PREFER : 0) |
+          (data.params.sel_options & SRC_SELECT_NOSELECT ? REQ_ADDSRC_NOSELECT : 0) |
+          (data.params.sel_options & SRC_SELECT_TRUST ? REQ_ADDSRC_TRUST : 0) |
+          (data.params.sel_options & SRC_SELECT_REQUIRE ? REQ_ADDSRC_REQUIRE : 0));
       result = 1;
 
-      break;
-    default:
-      CPS_StatusToString(status, str, sizeof (str));
-      fprintf(stderr, "%s\n", str);
       break;
   }
 
@@ -1007,7 +1126,7 @@ process_cmd_add_server_or_peer(CMD_Request *msg, char *line)
 static int
 process_cmd_add_server(CMD_Request *msg, char *line)
 {
-  msg->command = htons(REQ_ADD_SERVER);
+  msg->command = htons(REQ_ADD_SERVER2);
   return process_cmd_add_server_or_peer(msg, line);
 }
 
@@ -1016,7 +1135,7 @@ process_cmd_add_server(CMD_Request *msg, char *line)
 static int
 process_cmd_add_peer(CMD_Request *msg, char *line)
 {
-  msg->command = htons(REQ_ADD_PEER);
+  msg->command = htons(REQ_ADD_PEER2);
   return process_cmd_add_server_or_peer(msg, line);
 }
 
@@ -1034,11 +1153,11 @@ process_cmd_delete(CMD_Request *msg, char *line)
   CPS_SplitWord(line);
 
   if (!*hostname) {
-    fprintf(stderr, "Invalid syntax for address\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for address");
     ok = 0;
   } else {
     if (DNS_Name2IPAddress(hostname, &address, 1) != DNS_Success) {
-      fprintf(stderr, "Could not get address for hostname\n");
+      LOG(LOGS_ERR, LOGF_Client, "Could not get address for hostname");
       ok = 0;
     } else {
       UTI_IPHostToNetwork(&address, &msg->data.del_source.ip_addr);
@@ -1052,162 +1171,144 @@ process_cmd_delete(CMD_Request *msg, char *line)
 
 /* ================================================== */
 
-static char *password = NULL;
-static int password_length;
-static int auth_hash_id;
-
-/* ================================================== */
-
-static int
-process_cmd_password(CMD_Request *msg, char *line)
-{
-  char *p;
-  struct timeval now;
-  int i, len;
-
-  /* Blank and free the old password */
-  if (password) {
-    for (i = 0; i < password_length; i++)
-      password[i] = 0;
-    free(password);
-    password = NULL;
-  }
-
-  p = line;
-
-  if (!*p) {
-    /* blank line, prompt for password */
-    p = getpass("Password: ");
-  }
-
-  if (!*p)
-    return 0;
-
-  len = strlen(p);
-  password_length = UTI_DecodePasswordFromText(p);
-
-  if (password_length > 0) {
-    password = malloc(password_length);
-    memcpy(password, p, password_length);
-  }
-
-  /* Erase the password from the input or getpass buffer */
-  for (i = 0; i < len; i++)
-    p[i] = 0;
-
-  if (password_length <= 0) {
-      fprintf(stderr, "Could not decode password\n");
-      return 0;
-  }
-
-  if (gettimeofday(&now, NULL) < 0) {
-    printf("500 - Could not read time of day\n");
-    return 0;
-  } else {
-    msg->command = htons(REQ_LOGON); /* Just force a round trip so that we get tokens etc */
-    UTI_TimevalHostToNetwork(&now, &msg->data.logon.ts);
-    return 1;
-  }
-}
-
-/* ================================================== */
-
-static int
-generate_auth(CMD_Request *msg)
-{
-  int data_len;
-
-  data_len = PKL_CommandLength(msg);
-
-  assert(auth_hash_id >= 0);
-
-  return UTI_GenerateNTPAuth(auth_hash_id, (unsigned char *)password, password_length,
-      (unsigned char *)msg, data_len, ((unsigned char *)msg) + data_len, sizeof (msg->auth));
-}
-
-/* ================================================== */
-
-static int
-check_reply_auth(CMD_Reply *msg, int len)
-{
-  int data_len;
-
-  data_len = PKL_ReplyLength(msg);
-
-  assert(auth_hash_id >= 0);
-
-  return UTI_CheckNTPAuth(auth_hash_id, (unsigned char *)password, password_length,
-      (unsigned char *)msg, data_len,
-      ((unsigned char *)msg) + data_len, len - data_len);
-}
-
-/* ================================================== */
-
 static void
 give_help(void)
 {
-  printf("Commands:\n");
-  printf("accheck <address> : Check whether NTP access is allowed to <address>\n");
-  printf("activity : Check how many NTP sources are online/offline\n");
-  printf("add peer <address> ... : Add a new NTP peer\n");
-  printf("add server <address> ... : Add a new NTP server\n");
-  printf("allow [<subnet-addr>] : Allow NTP access to that subnet as a default\n");
-  printf("allow all [<subnet-addr>] : Allow NTP access to that subnet and all children\n");
-  printf("burst <n-good>/<n-max> [<mask>/<masked-address>] : Start a rapid set of measurements\n");
-  printf("clients : Report on clients that have accessed the server\n");
-  printf("cmdaccheck <address> : Check whether command access is allowed to <address>\n");
-  printf("cmdallow [<subnet-addr>] : Allow command access to that subnet as a default\n");
-  printf("cmdallow all [<subnet-addr>] : Allow command access to that subnet and all children\n");
-  printf("cmddeny [<subnet-addr>] : Deny command access to that subnet as a default\n");
-  printf("cmddeny all [<subnet-addr>] : Deny command access to that subnet and all children\n");
-  printf("cyclelogs : Close and re-open logs files\n");
-  printf("delete <address> : Remove an NTP server or peer\n");
-  printf("deny [<subnet-addr>] : Deny NTP access to that subnet as a default\n");
-  printf("deny all [<subnet-addr>] : Deny NTP access to that subnet and all children\n");
-  printf("dump : Dump all measurements to save files\n");
-  printf("local off : Disable server capability for unsynchronised clock\n");
-  printf("local stratum <stratum> : Enable server capability for unsynchronised clock\n");
-  printf("makestep [<threshold> <updates>] : Correct clock by stepping\n");
-  printf("manual off|on|reset : Disable/enable/reset settime command and statistics\n");
-  printf("manual list : Show previous settime entries\n");
-  printf("maxdelay <address> <new-max-delay> : Modify maximum round-trip valid sample delay for source\n");
-  printf("maxdelayratio <address> <new-max-ratio> : Modify max round-trip delay ratio for source\n");
-  printf("maxdelaydevratio <address> <new-max-ratio> : Modify max round-trip delay dev ratio for source\n");
-  printf("maxpoll <address> <new-maxpoll> : Modify maximum polling interval of source\n");
-  printf("maxupdateskew <new-max-skew> : Modify maximum skew for a clock frequency update to be made\n");
-  printf("minpoll <address> <new-minpoll> : Modify minimum polling interval of source\n");
-  printf("minstratum <address> <new-min-stratum> : Modify minimum stratum of source\n");
-  printf("offline [<mask>/<masked-address>] : Set sources in subnet to offline status\n");
-  printf("online [<mask>/<masked-address>] : Set sources in subnet to online status\n");
-  printf("password [<new-password>] : Set command authentication password\n");
-  printf("polltarget <address> <new-poll-target> : Modify poll target of source\n");
-  printf("reselect : Reselect synchronisation source\n");
-  printf("rtcdata : Print current RTC performance parameters\n");
-  printf("settime <date/time (e.g. Nov 21, 1997 16:30:05 or 16:30:05)> : Manually set the daemon time\n");
-  printf("smoothing : Display current time smoothing state\n");
-  printf("smoothtime reset|activate : Reset/activate time smoothing\n");
-  printf("sources [-v] : Display information about current sources\n");
-  printf("sourcestats [-v] : Display estimation information about current sources\n");
-  printf("tracking : Display system time information\n");
-  printf("trimrtc : Correct RTC relative to system clock\n");
-  printf("waitsync [max-tries [max-correction [max-skew]]] : Wait until synchronised\n");
-  printf("writertc : Save RTC parameters to file\n");
-  printf("\n");
-  printf("authhash <name>: Set command authentication hash function\n");
-  printf("dns -n|+n : Disable/enable resolving IP addresses to hostnames\n");
-  printf("dns -4|-6|-46 : Resolve hostnames only to IPv4/IPv6/both addresses\n");
-  printf("timeout <milliseconds> : Set initial response timeout\n");
-  printf("retries <n> : Set maximum number of retries\n");
-  printf("exit|quit : Leave the program\n");
-  printf("help : Generate this help\n");
-  printf("\n");
+  int line, len;
+  const char *s, cols[] =
+    "System clock:\0\0"
+    "tracking\0Display system time information\0"
+    "makestep\0Correct clock by stepping immediately\0"
+    "makestep <threshold> <updates>\0Configure automatic clock stepping\0"
+    "maxupdateskew <skew>\0Modify maximum valid skew to update frequency\0"
+    "waitsync [<max-tries> [<max-correction> [<max-skew> [<interval>]]]]\0"
+                          "Wait until synchronised in specified limits\0"
+    "\0\0"
+    "Time sources:\0\0"
+    "sources [-v]\0Display information about current sources\0"
+    "sourcestats [-v]\0Display statistics about collected measurements\0"
+    "reselect\0Force reselecting synchronisation source\0"
+    "reselectdist <dist>\0Modify reselection distance\0"
+    "\0\0"
+    "NTP sources:\0\0"
+    "activity\0Check how many NTP sources are online/offline\0"
+    "ntpdata [<address>]\0Display information about last valid measurement\0"
+    "add server <address> [options]\0Add new NTP server\0"
+    "add peer <address> [options]\0Add new NTP peer\0"
+    "delete <address>\0Remove server or peer\0"
+    "burst <n-good>/<n-max> [<mask>/<address>]\0Start rapid set of measurements\0"
+    "maxdelay <address> <delay>\0Modify maximum valid sample delay\0"
+    "maxdelayratio <address> <ratio>\0Modify maximum valid delay/minimum ratio\0"
+    "maxdelaydevratio <address> <ratio>\0Modify maximum valid delay/deviation ratio\0"
+    "minpoll <address> <poll>\0Modify minimum polling interval\0"
+    "maxpoll <address> <poll>\0Modify maximum polling interval\0"
+    "minstratum <address> <stratum>\0Modify minimum stratum\0"
+    "offline [<mask>/<address>]\0Set sources in subnet to offline status\0"
+    "online [<mask>/<address>]\0Set sources in subnet to online status\0"
+    "polltarget <address> <target>\0Modify poll target\0"
+    "refresh\0Refresh IP addresses\0"
+    "\0\0"
+    "Manual time input:\0\0"
+    "manual off|on|reset\0Disable/enable/reset settime command\0"
+    "manual list\0Show previous settime entries\0"
+    "manual delete <index>\0Delete previous settime entry\0"
+    "settime <time>\0Set daemon time\0"
+    "\0(e.g. Sep 25, 2015 16:30:05 or 16:30:05)\0"
+    "\0\0NTP access:\0\0"
+    "accheck <address>\0Check whether address is allowed\0"
+    "clients\0Report on clients that have accessed the server\0"
+    "serverstats\0Display statistics of the server\0"
+    "allow [<subnet>]\0Allow access to subnet as a default\0"
+    "allow all [<subnet>]\0Allow access to subnet and all children\0"
+    "deny [<subnet>]\0Deny access to subnet as a default\0"
+    "deny all [<subnet>]\0Deny access to subnet and all children\0"
+    "local [options]\0Serve time even when not synchronised\0"
+    "local off\0Don't serve time when not synchronised\0"
+    "smoothtime reset|activate\0Reset/activate time smoothing\0"
+    "smoothing\0Display current time smoothing state\0"
+    "\0\0"
+    "Monitoring access:\0\0"
+    "cmdaccheck <address>\0Check whether address is allowed\0"
+    "cmdallow [<subnet>]\0Allow access to subnet as a default\0"
+    "cmdallow all [<subnet>]\0Allow access to subnet and all children\0"
+    "cmddeny [<subnet>]\0Deny access to subnet as a default\0"
+    "cmddeny all [<subnet>]\0Deny access to subnet and all children\0"
+    "\0\0"
+    "Real-time clock:\0\0"
+    "rtcdata\0Print current RTC performance parameters\0"
+    "trimrtc\0Correct RTC relative to system clock\0"
+    "writertc\0Save RTC performance parameters to file\0"
+    "\0\0"
+    "Other daemon commands:\0\0"
+    "cyclelogs\0Close and re-open log files\0"
+    "dump\0Dump all measurements to save files\0"
+    "rekey\0Re-read keys from key file\0"
+    "\0\0"
+    "Client commands:\0\0"
+    "dns -n|+n\0Disable/enable resolving IP addresses to hostnames\0"
+    "dns -4|-6|-46\0Resolve hostnames only to IPv4/IPv6/both addresses\0"
+    "timeout <milliseconds>\0Set initial response timeout\0"
+    "retries <retries>\0Set maximum number of retries\0"
+    "keygen [<id> [<type> [<bits>]]]\0Generate key for key file\0"
+    "exit|quit\0Leave the program\0"
+    "help\0Generate this help\0"
+    "\0";
+
+  /* Indent the second column */
+  for (s = cols, line = 0; s < cols + sizeof (cols); s += len + 1, line++) {
+    len = strlen(s);
+    printf(line % 2 == 0 ? (len >= 28 ? "%s\n%28s" : "%-28s%s") : "%s%s\n",
+           s, "");
+  }
+}
+
+/* ================================================== */
+/* Tab-completion when editline/readline is available */
+
+#ifdef FEAT_READLINE
+static char *
+command_name_generator(const char *text, int state)
+{
+  const char *name, *names[] = {
+    "accheck", "activity", "add peer", "add server", "allow", "burst",
+    "clients", "cmdaccheck", "cmdallow", "cmddeny", "cyclelogs", "delete",
+    "deny", "dns", "dump", "exit", "help", "keygen", "local", "makestep",
+    "manual on", "manual off", "manual delete", "manual list", "manual reset",
+    "maxdelay", "maxdelaydevratio", "maxdelayratio", "maxpoll",
+    "maxupdateskew", "minpoll", "minstratum", "ntpdata", "offline", "online",
+    "polltarget", "quit", "refresh", "rekey", "reselect", "reselectdist",
+    "retries", "rtcdata", "serverstats", "settime", "smoothing", "smoothtime",
+    "sources", "sources -v", "sourcestats", "sourcestats -v", "timeout",
+    "tracking", "trimrtc", "waitsync", "writertc",
+    NULL
+  };
+  static int list_index, len;
+
+  if (!state) {
+    list_index = 0;
+    len = strlen(text);
+  }
+
+  while ((name = names[list_index++])) {
+    if (strncmp(name, text, len) == 0) {
+      return strdup(name);
+    }
+  }
+
+  return NULL;
 }
 
 /* ================================================== */
 
-static unsigned long sequence = 0;
-static unsigned long utoken = 0;
-static unsigned long token = 0;
+static char **
+command_name_completion(const char *text, int start, int end)
+{
+  rl_attempted_completion_over = 1;
+  return rl_completion_matches(text, command_name_generator);
+}
+#endif
+
+/* ================================================== */
 
 static int max_retries = 2;
 static int initial_timeout = 1000;
@@ -1219,86 +1320,81 @@ static int proto_version = PROTO_VERSION_NUMBER;
    successful or not.*/
 
 static int
-submit_request(CMD_Request *request, CMD_Reply *reply, int *reply_auth_ok)
+submit_request(CMD_Request *request, CMD_Reply *reply)
 {
-  unsigned long tx_sequence;
-  socklen_t where_from_len;
-  union sockaddr_in46 where_from;
-  int bad_length, bad_sender, bad_sequence, bad_header;
+  int bad_length, bad_sequence, bad_header;
   int select_status;
-  int recvfrom_status;
+  int recv_status;
   int read_length;
   int expected_length;
   int command_length;
   int padding_length;
-  int auth_length;
+  struct timespec ts_now, ts_start;
   struct timeval tv;
-  int timeout;
-  int n_attempts;
+  int n_attempts, new_attempt;
+  double timeout;
   fd_set rdfd, wrfd, exfd;
 
   request->pkt_type = PKT_TYPE_CMD_REQUEST;
   request->res1 = 0;
   request->res2 = 0;
-  tx_sequence = sequence++;
-  request->sequence = htonl(tx_sequence);
-  request->attempt = 0;
-  request->utoken = htonl(utoken);
-  request->token = htonl(token);
-
-  timeout = initial_timeout;
+  request->pad1 = 0;
+  request->pad2 = 0;
 
   n_attempts = 0;
+  new_attempt = 1;
 
   do {
-    request->version = proto_version;
-    command_length = PKL_CommandLength(request);
-    padding_length = PKL_CommandPaddingLength(request);
-    assert(command_length > 0 && command_length > padding_length);
+    if (new_attempt) {
+      new_attempt = 0;
 
-    /* Zero the padding to avoid sending uninitialized data. This needs to be
-       done before generating auth data as it includes the padding. */
-    memset(((char *)request) + command_length - padding_length, 0, padding_length);
+      if (n_attempts > max_retries)
+        return 0;
 
-    /* Decide whether to authenticate */
-    if (password) {
-      if (!utoken || (request->command == htons(REQ_LOGON))) {
-        /* Otherwise, the daemon won't bother authenticating our
-           packet and we won't get a token back */
-        request->utoken = htonl(SPECIAL_UTOKEN);
+      if (gettimeofday(&tv, NULL))
+        return 0;
+
+      UTI_TimevalToTimespec(&tv, &ts_start);
+
+      UTI_GetRandomBytes(&request->sequence, sizeof (request->sequence));
+      request->attempt = htons(n_attempts);
+      request->version = proto_version;
+      command_length = PKL_CommandLength(request);
+      padding_length = PKL_CommandPaddingLength(request);
+      assert(command_length > 0 && command_length > padding_length);
+
+      n_attempts++;
+
+      /* Zero the padding to not send any uninitialized data */
+      memset(((char *)request) + command_length - padding_length, 0, padding_length);
+
+      if (sock_fd < 0) {
+        DEBUG_LOG(LOGF_Client, "No socket to send request");
+        return 0;
       }
-      auth_length = generate_auth(request);
-    } else {
-      auth_length = 0;
+
+      if (send(sock_fd, (void *)request, command_length, 0) < 0) {
+        DEBUG_LOG(LOGF_Client, "Could not send %d bytes : %s",
+                  command_length, strerror(errno));
+        return 0;
+      }
+
+      DEBUG_LOG(LOGF_Client, "Sent %d bytes", command_length);
     }
 
-    /* add empty MD5 auth so older servers will not drop the request
-       due to bad length */
-    if (!auth_length) {
-      memset(((char *)request) + command_length, 0, 16);
-      auth_length = 16;
-    }
-
-#if 0
-    printf("Sent command length=%d bytes auth length=%d bytes\n", command_length, auth_length);
-#endif
-
-    if (sendto(sock_fd, (void *) request, command_length + auth_length, 0,
-               &his_addr.u, his_addr_len) < 0) {
-
-
-#if 0
-      perror("Could not send packet");
-#endif
+    if (gettimeofday(&tv, NULL))
       return 0;
-    }
 
-    /* Increment this for next time */
-    ++ request->attempt;
-      
-    tv.tv_sec = timeout / 1000;
-    tv.tv_usec = timeout % 1000 * 1000;
-    timeout *= 2;
+    UTI_TimevalToTimespec(&tv, &ts_now);
+
+    /* Check if the clock wasn't stepped back */
+    if (UTI_CompareTimespecs(&ts_now, &ts_start) < 0)
+      ts_start = ts_now;
+
+    timeout = initial_timeout / 1000.0 * (1U << (n_attempts - 1)) -
+              UTI_DiffTimespecsToDouble(&ts_now, &ts_start);
+    UTI_DoubleToTimeval(timeout, &tv);
+    DEBUG_LOG(LOGF_Client, "Timeout %f seconds", timeout);
 
     FD_ZERO(&rdfd);
     FD_ZERO(&wrfd);
@@ -1306,53 +1402,28 @@ submit_request(CMD_Request *request, CMD_Reply *reply, int *reply_auth_ok)
 
     FD_SET(sock_fd, &rdfd);
 
+    if (quit)
+      return 0;
+
     select_status = select(sock_fd + 1, &rdfd, &wrfd, &exfd, &tv);
 
     if (select_status < 0) {
-#if 0
-      perror("Select returned negative status");
-#endif
+      DEBUG_LOG(LOGF_Client, "select failed : %s", strerror(errno));
     } else if (select_status == 0) {
       /* Timeout must have elapsed, try a resend? */
-      n_attempts ++;
-      if (n_attempts > max_retries) {
-        return 0;
-      }
-
-      /* Back to top of loop to do resend */
-      continue;
-      
+      new_attempt = 1;
     } else {
+      recv_status = recv(sock_fd, (void *)reply, sizeof(CMD_Reply), 0);
       
-      where_from_len = sizeof(where_from);
-      recvfrom_status = recvfrom(sock_fd, (void *) reply, sizeof(CMD_Reply), 0,
-                                 &where_from.u, &where_from_len);
-      
-
-#if 0
-      printf("Received packet, status=%d\n", recvfrom_status);
-#endif
-
-      if (recvfrom_status < 0) {
+      if (recv_status < 0) {
         /* If we get connrefused here, it suggests the sendto is
-           going to a dead port - but only if the daemon machine is
-           running Linux (Solaris doesn't return anything) */
-
-#ifdef IP_RECVERR
-        /* Fetch the message from the error queue */
-        if (recv_errqueue &&
-            recvfrom(sock_fd, (void *)reply, sizeof(CMD_Reply), MSG_ERRQUEUE,
-                     &where_from.u, &where_from_len) < 0)
-          ;
-#endif
-
-        n_attempts++;
-        if (n_attempts > max_retries) {
-          return 0;
-        }
+           going to a dead port */
+        DEBUG_LOG(LOGF_Client, "Could not receive : %s", strerror(errno));
+        new_attempt = 1;
       } else {
+        DEBUG_LOG(LOGF_Client, "Received %d bytes", recv_status);
         
-        read_length = recvfrom_status;
+        read_length = recv_status;
         if (read_length >= offsetof(CMD_Reply, data)) {
           expected_length = PKL_ReplyLength(reply);
         } else {
@@ -1361,29 +1432,14 @@ submit_request(CMD_Request *request, CMD_Reply *reply, int *reply_auth_ok)
 
         bad_length = (read_length < expected_length ||
                       expected_length < offsetof(CMD_Reply, data));
-        bad_sender = (where_from.u.sa_family != his_addr.u.sa_family ||
-                      (where_from.u.sa_family == AF_INET &&
-                       (where_from.in4.sin_addr.s_addr != his_addr.in4.sin_addr.s_addr ||
-                        where_from.in4.sin_port != his_addr.in4.sin_port)) ||
-#ifdef FEAT_IPV6
-                      (where_from.u.sa_family == AF_INET6 &&
-                       (memcmp(where_from.in6.sin6_addr.s6_addr, his_addr.in6.sin6_addr.s6_addr,
-                               sizeof (where_from.in6.sin6_addr.s6_addr)) != 0 ||
-                        where_from.in6.sin6_port != his_addr.in6.sin6_port)) ||
-#endif
-                      0);
         
         if (!bad_length) {
-          bad_sequence = (ntohl(reply->sequence) != tx_sequence);
+          bad_sequence = reply->sequence != request->sequence;
         } else {
           bad_sequence = 0;
         }
         
-        if (bad_length || bad_sender || bad_sequence) {
-          n_attempts++;
-          if (n_attempts > max_retries) {
-            return 0;
-          }
+        if (bad_length || bad_sequence) {
           continue;
         }
         
@@ -1396,10 +1452,6 @@ submit_request(CMD_Request *request, CMD_Reply *reply, int *reply_auth_ok)
                       (reply->command != request->command));
         
         if (bad_header) {
-          n_attempts++;
-          if (n_attempts > max_retries) {
-            return 0;
-          }
           continue;
         }
         
@@ -1410,6 +1462,8 @@ submit_request(CMD_Request *request, CMD_Reply *reply, int *reply_auth_ok)
         if (proto_version == PROTO_VERSION_NUMBER &&
             reply->version == PROTO_VERSION_NUMBER - 1) {
           proto_version = PROTO_VERSION_NUMBER - 1;
+          n_attempts--;
+          new_attempt = 1;
           continue;
         }
 #else
@@ -1417,38 +1471,9 @@ submit_request(CMD_Request *request, CMD_Reply *reply, int *reply_auth_ok)
 #endif
 
         /* Good packet received, print out results */
-#if 0
-        printf("Reply cmd=%d reply=%d stat=%d seq=%d utok=%08lx tok=%d\n",
-               ntohs(reply->command), ntohs(reply->reply),
-               ntohs(reply->status),
-               ntohl(reply->sequence),
-               ntohl(reply->utoken),
-               ntohl(reply->token));
-#endif
-
-        if (password) {
-          *reply_auth_ok = check_reply_auth(reply, read_length);
-        } else {
-          /* Assume in this case that the reply is always considered
-             to be authentic */
-          *reply_auth_ok = 1;
-        }
-            
-        utoken = ntohl(reply->utoken);
-
-        if (*reply_auth_ok) {
-          /* If we're in authenticated mode, only acquire the utoken
-             and new token values if the reply authenticated properly.
-             This protects against forged packets with bogus tokens
-             in.  We won't accept a repeat of an old message with a
-             stale token in it, due to bad_sequence processing
-             earlier. */
-          utoken = ntohl(reply->utoken);
-          token = ntohl(reply->token);
-        }
-        
+        DEBUG_LOG(LOGF_Client, "Reply cmd=%d reply=%d stat=%d",
+                  ntohs(reply->command), ntohs(reply->reply), ntohs(reply->status));
         break;
-
       }
     }
   } while (1);
@@ -1461,10 +1486,12 @@ submit_request(CMD_Request *request, CMD_Reply *reply, int *reply_auth_ok)
 static int
 request_reply(CMD_Request *request, CMD_Reply *reply, int requested_reply, int verbose)
 {
-  int reply_auth_ok;
   int status;
 
-  if (!submit_request(request, reply, &reply_auth_ok)) {
+  while (!submit_request(request, reply)) {
+    /* Try connecting to other addresses before giving up */
+    if (open_io())
+      continue;
     printf("506 Cannot talk to daemon\n");
     return 0;
   }
@@ -1536,11 +1563,7 @@ request_reply(CMD_Request *request, CMD_Reply *reply, int requested_reply, int v
       default:
         printf("520 Got unexpected error from daemon");
     }
-    if (reply_auth_ok) {
-      printf("\n");
-    } else {
-      printf(" --- Reply not authenticated\n");
-    }
+    printf("\n");
   }
   
   if (status != STT_SUCCESS &&
@@ -1562,7 +1585,10 @@ static void
 print_seconds(unsigned long s)
 {
   unsigned long d;
-  if (s <= 1024) {
+
+  if (s == (uint32_t)-1) {
+    printf("   -");
+  } else if (s < 1200) {
     printf("%4ld", s);
   } else if (s < 36000) {
     printf("%3ldm", s / 60);
@@ -1662,15 +1688,331 @@ print_signed_freq_ppm(double f)
 
 /* ================================================== */
 
+static void
+print_clientlog_interval(int rate)
+{
+  if (rate >= 127) {
+    printf(" -");
+  } else {
+    printf("%2d", rate);
+  }
+}
+
+/* ================================================== */
+
+static void
+print_header(const char *header)
+{
+  int len;
+
+  if (csv_mode)
+    return;
+
+  printf("%s\n", header);
+
+  len = strlen(header);
+  while (len--)
+    printf("=");
+  printf("\n");
+}
+
+/* ================================================== */
+
+#define REPORT_END 0x1234
+
+/* Print a report. The syntax of the format is similar to printf(), but not all
+   specifiers are supported and some are different! */
+
+static void
+print_report(const char *format, ...)
+{
+  char buf[256];
+  va_list ap;
+  int i, field, sign, width, prec, spec;
+  const char *string;
+  unsigned long long_uinteger;
+  unsigned int uinteger;
+  int integer;
+  struct timespec *ts;
+  struct tm *tm;
+  double dbl;
+
+  va_start(ap, format);
+
+  for (field = 0; ; field++) {
+    /* Search for text between format specifiers and print it
+       if not in the CSV mode */
+    for (i = 0; i < sizeof (buf) && format[i] != '%' && format[i] != '\0'; i++)
+      buf[i] = format[i];
+
+    if (i >= sizeof (buf))
+      break;
+
+    buf[i] = '\0';
+
+    if (!csv_mode)
+      printf("%s", buf);
+
+    if (format[i] == '\0' || format[i + 1] == '\0')
+      break;
+
+    format += i + 1;
+
+    sign = 0;
+    width = 0;
+    prec = 5;
+
+    if (*format == '+' || *format == '-') {
+      sign = 1;
+      format++;
+    }
+
+    if (isdigit((unsigned char)*format)) {
+      width = atoi(format);
+      while (isdigit((unsigned char)*format))
+        format++;
+    }
+
+    if (*format == '.') {
+      format++;
+      prec = atoi(format);
+      while (isdigit((unsigned char)*format))
+        format++;
+    }
+
+    spec = *format;
+    format++;
+
+    /* Disable human-readable formatting in the CSV mode */
+    if (csv_mode) {
+      sign = width = 0;
+
+      if (field > 0)
+        printf(",");
+
+      switch (spec) {
+        case 'C':
+          spec = 'd';
+          break;
+        case 'F':
+        case 'P':
+          prec = 3;
+          spec = 'f';
+          break;
+        case 'O':
+        case 'S':
+          prec = 9;
+          spec = 'f';
+          break;
+        case 'I':
+          spec = 'U';
+          break;
+        case 'T':
+          spec = 'V';
+          break;
+      }
+    }
+
+    switch (spec) {
+      case 'B': /* boolean */
+        integer = va_arg(ap, int);
+        printf("%s", integer ? "Yes" : "No");
+        break;
+      case 'C': /* clientlog interval */
+        integer = va_arg(ap, int);
+        print_clientlog_interval(integer);
+        break;
+      case 'F': /* absolute frequency in ppm with fast/slow keyword */
+      case 'O': /* absolute offset in seconds with fast/slow keyword */
+        dbl = va_arg(ap, double);
+        printf("%*.*f %s %s", width, prec, fabs(dbl),
+               spec == 'O' ? "seconds" : "ppm",
+               (dbl > 0.0) ^ (spec != 'O') ? "slow" : "fast");
+        break;
+      case 'I': /* interval with unit */
+        long_uinteger = va_arg(ap, unsigned long);
+        print_seconds(long_uinteger);
+        break;
+      case 'L': /* leap status */
+        integer = va_arg(ap, int);
+        switch (integer) {
+          case LEAP_Normal:
+            string = "Normal";
+            break;
+          case LEAP_InsertSecond:
+            string = "Insert second";
+            break;
+          case LEAP_DeleteSecond:
+            string = "Delete second";
+            break;
+          case LEAP_Unsynchronised:
+            string = "Not synchronised";
+            break;
+          default:
+            string = "Invalid";
+            break;
+        }
+        printf("%s", string);
+        break;
+      case 'M': /* NTP mode */
+        integer = va_arg(ap, int);
+        switch (integer) {
+          case MODE_ACTIVE:
+            string = "Symmetric active";
+            break;
+          case MODE_PASSIVE:
+            string = "Symmetric passive";
+            break;
+          case MODE_SERVER:
+            string = "Server";
+            break;
+          default:
+            string = "Invalid";
+            break;
+        }
+        printf("%s", string);
+        break;
+      case 'N': /* Timestamp source */
+        integer = va_arg(ap, int);
+        switch (integer) {
+          case 'D':
+            string = "Daemon";
+            break;
+          case 'K':
+            string = "Kernel";
+            break;
+          case 'H':
+            string = "Hardware";
+            break;
+          default:
+            string = "Invalid";
+            break;
+        }
+        printf("%s", string);
+        break;
+      case 'P': /* frequency in ppm */
+        dbl = va_arg(ap, double);
+        if (sign)
+          print_signed_freq_ppm(dbl);
+        else
+          print_freq_ppm(dbl);
+        break;
+      case 'R': /* reference ID in hexdecimal */
+        long_uinteger = va_arg(ap, unsigned long);
+        printf("%08lX", long_uinteger);
+        break;
+      case 'S': /* offset with unit */
+        dbl = va_arg(ap, double);
+        if (sign)
+          print_signed_nanoseconds(dbl);
+        else
+          print_nanoseconds(dbl);
+        break;
+      case 'T': /* timespec as date and time in UTC */
+        ts = va_arg(ap, struct timespec *);
+        tm = gmtime(&ts->tv_sec);
+        if (!tm)
+          break;
+        strftime(buf, sizeof (buf), "%a %b %d %T %Y", tm);
+        printf("%s", buf);
+        break;
+      case 'U': /* unsigned long in decimal */
+        long_uinteger = va_arg(ap, unsigned long);
+        printf("%*lu", width, long_uinteger);
+        break;
+      case 'V': /* timespec as seconds since epoch */
+        ts = va_arg(ap, struct timespec *);
+        printf("%s", UTI_TimespecToString(ts));
+        break;
+      case 'b': /* unsigned int in binary */
+        uinteger = va_arg(ap, unsigned int);
+        for (i = prec - 1; i >= 0; i--)
+          printf("%c", uinteger & 1U << i ? '1' : '0');
+        break;
+
+      /* Classic printf specifiers */
+      case 'c': /* character */
+        integer = va_arg(ap, int);
+        printf("%c", integer);
+        break;
+      case 'd': /* signed int in decimal */
+        integer = va_arg(ap, int);
+        printf("%*d", width, integer);
+        break;
+      case 'f': /* double */
+        dbl = va_arg(ap, double);
+        printf(sign ? "%+*.*f" : "%*.*f", width, prec, dbl);
+        break;
+      case 'o': /* unsigned int in octal */
+        uinteger = va_arg(ap, unsigned int);
+        printf("%*o", width, uinteger);
+        break;
+      case 's': /* string */
+        string = va_arg(ap, const char *);
+        if (sign)
+          printf("%-*s", width, string);
+        else
+          printf("%*s", width, string);
+        break;
+      case 'u': /* unsigned int in decimal */
+        uinteger = va_arg(ap, unsigned int);
+        printf("%*u", width, uinteger);
+        break;
+    }
+  }
+
+  /* Require terminating argument to catch bad type conversions */
+  if (va_arg(ap, int) != REPORT_END)
+    assert(0);
+
+  va_end(ap);
+
+  if (csv_mode)
+    printf("\n");
+}
+
+/* ================================================== */
+
+static void
+print_info_field(const char *format, ...)
+{
+  va_list ap;
+
+  if (csv_mode)
+    return;
+
+  va_start(ap, format);
+  vprintf(format, ap);
+  va_end(ap);
+}
+
+/* ================================================== */
+
+static void
+format_name(char *buf, int size, int trunc_dns, int ref, uint32_t ref_id,
+            IPAddr *ip_addr)
+{
+  if (ref) {
+    snprintf(buf, size, "%s", UTI_RefidToString(ref_id));
+  } else if (no_dns || csv_mode) {
+    snprintf(buf, size, "%s", UTI_IPToString(ip_addr));
+  } else {
+    DNS_IPAddress2Name(ip_addr, buf, size);
+    if (trunc_dns > 0 && strlen(buf) > trunc_dns) {
+      buf[trunc_dns - 1] = '>';
+      buf[trunc_dns] = '\0';
+    }
+  }
+}
+
+/* ================================================== */
+
 static int
 check_for_verbose_flag(char *line)
 {
-  char *p = line;
-  if (!strcmp(p, "-v")) {
+  if (!csv_mode && !strcmp(line, "-v"))
     return 1;
-  } else {
-    return 0;
-  }
+  return 0;
 }
 
 /* ================================================== */
@@ -1680,113 +2022,102 @@ process_cmd_sources(char *line)
 {
   CMD_Request request;
   CMD_Reply reply;
-  int n_sources, i;
-  int verbose = 0;
-
-  double orig_latest_meas, latest_meas, latest_meas_err;
   IPAddr ip_addr;
-  uint32_t latest_meas_ago;
-  int16_t poll;
-  uint16_t stratum, state, mode, flags, reachability;
-  char hostname_buf[50];
+  uint32_t i, mode, n_sources;
+  char name[50], mode_ch, state_ch;
+  int verbose;
 
   /* Check whether to output verbose headers */
   verbose = check_for_verbose_flag(line);
   
   request.command = htons(REQ_N_SOURCES);
-  if (request_reply(&request, &reply, RPY_N_SOURCES, 0)) {
-    n_sources = ntohl(reply.data.n_sources.n_sources);
-    printf("210 Number of sources = %d\n", n_sources);
-    if (verbose) {
-      printf("\n");
-      printf("  .-- Source mode  '^' = server, '=' = peer, '#' = local clock.\n");
-      printf(" / .- Source state '*' = current synced, '+' = combined , '-' = not combined,\n");
-      printf("| /   '?' = unreachable, 'x' = time may be in error, '~' = time too variable.\n");
-      printf("||                                                 .- xxxx [ yyyy ] +/- zzzz\n");
-      printf("||      Reachability register (octal) -.           |  xxxx = adjusted offset,\n");
-      printf("||      Log2(Polling interval) --.      |          |  yyyy = measured offset,\n");
-      printf("||                                \\     |          |  zzzz = estimated error.\n");
-      printf("||                                 |    |           \\\n");
-    }
-
-    printf("MS Name/IP address         Stratum Poll Reach LastRx Last sample\n");
-    printf("===============================================================================\n");
-
-    /*     "MS NNNNNNNNNNNNNNNNNNNNNNNNNNN  SS  PP   RRR  RRRR  SSSSSSS[SSSSSSS] +/- SSSSSS" */
-
-    for (i=0; i<n_sources; i++) {
-      request.command = htons(REQ_SOURCE_DATA);
-      request.data.source_data.index = htonl(i);
-      if (request_reply(&request, &reply, RPY_SOURCE_DATA, 0)) {
-          UTI_IPNetworkToHost(&reply.data.source_data.ip_addr, &ip_addr);
-          poll = ntohs(reply.data.source_data.poll);
-          stratum = ntohs(reply.data.source_data.stratum);
-          state = ntohs(reply.data.source_data.state);
-          mode = ntohs(reply.data.source_data.mode);
-          flags = ntohs(reply.data.source_data.flags);
-          reachability = ntohs(reply.data.source_data.reachability);
-          latest_meas_ago = ntohl(reply.data.source_data.since_sample);
-          orig_latest_meas = UTI_FloatNetworkToHost(reply.data.source_data.orig_latest_meas);
-          latest_meas = UTI_FloatNetworkToHost(reply.data.source_data.latest_meas);
-          latest_meas_err = UTI_FloatNetworkToHost(reply.data.source_data.latest_meas_err);
-
-          if (mode == RPY_SD_MD_REF) {
-            snprintf(hostname_buf, sizeof(hostname_buf), "%s", UTI_RefidToString(ip_addr.addr.in4));
-          } else if (no_dns) {
-            snprintf(hostname_buf, sizeof(hostname_buf), "%s", UTI_IPToString(&ip_addr));
-          } else {
-            DNS_IPAddress2Name(&ip_addr, hostname_buf, sizeof(hostname_buf));
-            hostname_buf[25] = 0;
-          }
-
-          switch (mode) {
-            case RPY_SD_MD_CLIENT:
-              printf("^"); break;
-            case RPY_SD_MD_PEER:
-              printf("="); break;
-            case RPY_SD_MD_REF:
-              printf("#"); break;
-            default:
-              printf(" ");
-          }
-          switch (state) {
-            case RPY_SD_ST_SYNC:
-              printf("*"); break;
-            case RPY_SD_ST_UNREACH:
-              printf("?"); break;
-            case RPY_SD_ST_FALSETICKER:
-              printf("x"); break;
-            case RPY_SD_ST_JITTERY:
-              printf("~"); break;
-            case RPY_SD_ST_CANDIDATE:
-              printf("+"); break;
-            case RPY_SD_ST_OUTLIER:
-              printf("-"); break;
-            default:
-              printf(" ");
-          }
-          switch (flags) {
-            default:
-              break;
-          }
-
-          printf(" %-27s  %2d  %2d   %3o  ", hostname_buf, stratum, poll, reachability);
-          print_seconds(latest_meas_ago);
-          printf("  ");
-          print_signed_nanoseconds(latest_meas);
-          printf("[");
-          print_signed_nanoseconds(orig_latest_meas);
-          printf("]");
-          printf(" +/- ");
-          print_nanoseconds(latest_meas_err);
-          printf("\n");
-      } else {
-        return 0;
-      }
-    }
-  } else {
+  if (!request_reply(&request, &reply, RPY_N_SOURCES, 0))
     return 0;
+
+  n_sources = ntohl(reply.data.n_sources.n_sources);
+  print_info_field("210 Number of sources = %lu\n", (unsigned long)n_sources);
+
+  if (verbose) {
+    printf("\n");
+    printf("  .-- Source mode  '^' = server, '=' = peer, '#' = local clock.\n");
+    printf(" / .- Source state '*' = current synced, '+' = combined , '-' = not combined,\n");
+    printf("| /   '?' = unreachable, 'x' = time may be in error, '~' = time too variable.\n");
+    printf("||                                                 .- xxxx [ yyyy ] +/- zzzz\n");
+    printf("||      Reachability register (octal) -.           |  xxxx = adjusted offset,\n");
+    printf("||      Log2(Polling interval) --.      |          |  yyyy = measured offset,\n");
+    printf("||                                \\     |          |  zzzz = estimated error.\n");
+    printf("||                                 |    |           \\\n");
   }
+
+  print_header("MS Name/IP address         Stratum Poll Reach LastRx Last sample               ");
+
+  /*           "MS NNNNNNNNNNNNNNNNNNNNNNNNNNN  SS  PP   RRR  RRRR  SSSSSSS[SSSSSSS] +/- SSSSSS" */
+
+  for (i = 0; i < n_sources; i++) {
+    request.command = htons(REQ_SOURCE_DATA);
+    request.data.source_data.index = htonl(i);
+    if (!request_reply(&request, &reply, RPY_SOURCE_DATA, 0))
+      return 0;
+
+    mode = ntohs(reply.data.source_data.mode);
+    UTI_IPNetworkToHost(&reply.data.source_data.ip_addr, &ip_addr);
+    format_name(name, sizeof (name), 25, mode == RPY_SD_MD_REF,
+                ip_addr.addr.in4, &ip_addr);
+
+    switch (mode) {
+      case RPY_SD_MD_CLIENT:
+        mode_ch = '^';
+        break;
+      case RPY_SD_MD_PEER:
+        mode_ch = '=';
+        break;
+      case RPY_SD_MD_REF:
+        mode_ch = '#';
+        break;
+      default:
+        mode_ch = ' ';
+    }
+
+    switch (ntohs(reply.data.source_data.state)) {
+      case RPY_SD_ST_SYNC:
+        state_ch = '*';
+        break;
+      case RPY_SD_ST_UNREACH:
+        state_ch = '?';
+        break;
+      case RPY_SD_ST_FALSETICKER:
+        state_ch = 'x';
+        break;
+      case RPY_SD_ST_JITTERY:
+        state_ch = '~';
+        break;
+      case RPY_SD_ST_CANDIDATE:
+        state_ch = '+';
+        break;
+      case RPY_SD_ST_OUTLIER:
+        state_ch = '-';
+        break;
+      default:
+        state_ch = ' ';
+    }
+
+    switch (ntohs(reply.data.source_data.flags)) {
+      default:
+        break;
+    }
+
+    print_report("%c%c %-27s  %2d  %2d   %3o  %I  %+S[%+S] +/- %S\n",
+                 mode_ch, state_ch, name,
+                 ntohs(reply.data.source_data.stratum),
+                 (int16_t)ntohs(reply.data.source_data.poll),
+                 ntohs(reply.data.source_data.reachability),
+                 (unsigned long)ntohl(reply.data.source_data.since_sample),
+                 UTI_FloatNetworkToHost(reply.data.source_data.latest_meas),
+                 UTI_FloatNetworkToHost(reply.data.source_data.orig_latest_meas),
+                 UTI_FloatNetworkToHost(reply.data.source_data.latest_meas_err),
+                 REPORT_END);
+  }
+
   return 1;
 }
 
@@ -1797,80 +2128,58 @@ process_cmd_sourcestats(char *line)
 {
   CMD_Request request;
   CMD_Reply reply;
-  int n_sources, i;
+  uint32_t i, n_sources;
   int verbose = 0;
-
-  char hostname_buf[50];
-  unsigned long n_samples, n_runs, span_seconds;
-  double resid_freq_ppm, skew_ppm, sd, est_offset;
-  uint32_t ref_id;
+  char name[50];
   IPAddr ip_addr;
 
   verbose = check_for_verbose_flag(line);
 
   request.command = htons(REQ_N_SOURCES);
-  if (request_reply(&request, &reply, RPY_N_SOURCES, 0)) {
-    n_sources = ntohl(reply.data.n_sources.n_sources);
-    printf("210 Number of sources = %d\n", n_sources);
-    if (verbose) {
-      printf("                             .- Number of sample points in measurement set.\n");
-      printf("                            /    .- Number of residual runs with same sign.\n");
-      printf("                           |    /    .- Length of measurement set (time).\n");
-      printf("                           |   |    /      .- Est. clock freq error (ppm).\n");
-      printf("                           |   |   |      /           .- Est. error in freq.\n");
-      printf("                           |   |   |     |           /         .- Est. offset.\n");
-      printf("                           |   |   |     |          |          |   On the -.\n");
-      printf("                           |   |   |     |          |          |   samples. \\\n");
-      printf("                           |   |   |     |          |          |             |\n");
-    }
-
-    printf("Name/IP Address            NP  NR  Span  Frequency  Freq Skew  Offset  Std Dev\n");
-    printf("==============================================================================\n");
-
-    /*      NNNNNNNNNNNNNNNNNNNNNNNNN  NP  NR  SSSS FFFFFFFFFF SSSSSSSSSS  SSSSSSS  SSSSSS*/
-
-    for (i=0; i<n_sources; i++) {
-      request.command = htons(REQ_SOURCESTATS);
-      request.data.source_data.index = htonl(i);
-      if (request_reply(&request, &reply, RPY_SOURCESTATS, 0)) {
-          ref_id = ntohl(reply.data.sourcestats.ref_id);
-          UTI_IPNetworkToHost(&reply.data.sourcestats.ip_addr, &ip_addr);
-          n_samples = ntohl(reply.data.sourcestats.n_samples);
-          n_runs = ntohl(reply.data.sourcestats.n_runs);
-          span_seconds = ntohl(reply.data.sourcestats.span_seconds);
-          resid_freq_ppm = UTI_FloatNetworkToHost(reply.data.sourcestats.resid_freq_ppm);
-          skew_ppm = UTI_FloatNetworkToHost(reply.data.sourcestats.skew_ppm);
-          sd = UTI_FloatNetworkToHost(reply.data.sourcestats.sd);
-          est_offset = UTI_FloatNetworkToHost(reply.data.sourcestats.est_offset);
-          /* est_offset_err = UTI_FloatNetworkToHost(reply.data.sourcestats.est_offset_err); */
-
-          if (ip_addr.family == IPADDR_UNSPEC)
-            snprintf(hostname_buf, sizeof(hostname_buf), "%s", UTI_RefidToString(ref_id));
-          else if (no_dns) {
-            snprintf(hostname_buf, sizeof(hostname_buf), "%s", UTI_IPToString(&ip_addr));
-          } else {
-            DNS_IPAddress2Name(&ip_addr, hostname_buf, sizeof(hostname_buf));
-            hostname_buf[25] = 0;
-          }
-
-          printf("%-25s %3lu %3lu  ", hostname_buf, n_samples, n_runs);
-          print_seconds(span_seconds);
-          printf(" ");
-          print_signed_freq_ppm(resid_freq_ppm);
-          printf(" ");
-          print_freq_ppm(skew_ppm);
-          printf("  ");
-          print_signed_nanoseconds(est_offset);
-          printf("  ");
-          print_nanoseconds(sd);
-          printf("\n");
-      } else {
-        return 0;
-      }
-    }
-  } else {
+  if (!request_reply(&request, &reply, RPY_N_SOURCES, 0))
     return 0;
+
+  n_sources = ntohl(reply.data.n_sources.n_sources);
+  print_info_field("210 Number of sources = %lu\n", (unsigned long)n_sources);
+
+  if (verbose) {
+    printf("                             .- Number of sample points in measurement set.\n");
+    printf("                            /    .- Number of residual runs with same sign.\n");
+    printf("                           |    /    .- Length of measurement set (time).\n");
+    printf("                           |   |    /      .- Est. clock freq error (ppm).\n");
+    printf("                           |   |   |      /           .- Est. error in freq.\n");
+    printf("                           |   |   |     |           /         .- Est. offset.\n");
+    printf("                           |   |   |     |          |          |   On the -.\n");
+    printf("                           |   |   |     |          |          |   samples. \\\n");
+    printf("                           |   |   |     |          |          |             |\n");
   }
+
+  print_header("Name/IP Address            NP  NR  Span  Frequency  Freq Skew  Offset  Std Dev");
+
+  /*           "NNNNNNNNNNNNNNNNNNNNNNNNN  NP  NR  SSSS FFFFFFFFFF SSSSSSSSSS  SSSSSSS  SSSSSS" */
+
+  for (i = 0; i < n_sources; i++) {
+    request.command = htons(REQ_SOURCESTATS);
+    request.data.source_data.index = htonl(i);
+    if (!request_reply(&request, &reply, RPY_SOURCESTATS, 0))
+      return 0;
+
+    UTI_IPNetworkToHost(&reply.data.sourcestats.ip_addr, &ip_addr);
+    format_name(name, sizeof (name), 25, ip_addr.family == IPADDR_UNSPEC,
+                ntohl(reply.data.sourcestats.ref_id), &ip_addr);
+
+    print_report("%-25s %3U %3U  %I %+P %P  %+S  %S\n",
+                 name,
+                 (unsigned long)ntohl(reply.data.sourcestats.n_samples),
+                 (unsigned long)ntohl(reply.data.sourcestats.n_runs),
+                 (unsigned long)ntohl(reply.data.sourcestats.span_seconds),
+                 UTI_FloatNetworkToHost(reply.data.sourcestats.resid_freq_ppm),
+                 UTI_FloatNetworkToHost(reply.data.sourcestats.skew_ppm),
+                 UTI_FloatNetworkToHost(reply.data.sourcestats.est_offset),
+                 UTI_FloatNetworkToHost(reply.data.sourcestats.sd),
+                 REPORT_END);
+  }
+
   return 1;
 }
 
@@ -1883,87 +2192,192 @@ process_cmd_tracking(char *line)
   CMD_Reply reply;
   IPAddr ip_addr;
   uint32_t ref_id;
-  char host[50];
-  char *ref_ip;
-  struct timeval ref_time;
-  struct tm ref_time_tm;
-  unsigned long a, b, c, d;
-  double correction;
-  double last_offset;
-  double rms_offset;
-  double freq_ppm;
-  double resid_freq_ppm;
-  double skew_ppm;
-  double root_delay;
-  double root_dispersion;
-  double last_update_interval;
-  const char *leap_status;
+  char name[50];
+  struct timespec ref_time;
   
   request.command = htons(REQ_TRACKING);
-  if (request_reply(&request, &reply, RPY_TRACKING, 0)) {
-    ref_id = ntohl(reply.data.tracking.ref_id);
-    a = (ref_id >> 24);
-    b = (ref_id >> 16) & 0xff;
-    c = (ref_id >> 8) & 0xff;
-    d = (ref_id) & 0xff;
-    
-    UTI_IPNetworkToHost(&reply.data.tracking.ip_addr, &ip_addr);
-    if (ip_addr.family == IPADDR_UNSPEC) {
-      ref_ip = UTI_RefidToString(ref_id);
-    } else if (no_dns) {
-      ref_ip = UTI_IPToString(&ip_addr);
+  if (!request_reply(&request, &reply, RPY_TRACKING, 0))
+    return 0;
+
+  ref_id = ntohl(reply.data.tracking.ref_id);
+
+  UTI_IPNetworkToHost(&reply.data.tracking.ip_addr, &ip_addr);
+  format_name(name, sizeof (name), sizeof (name),
+              ip_addr.family == IPADDR_UNSPEC, ref_id, &ip_addr);
+
+  UTI_TimespecNetworkToHost(&reply.data.tracking.ref_time, &ref_time);
+
+  print_report("Reference ID    : %R (%s)\n"
+               "Stratum         : %u\n"
+               "Ref time (UTC)  : %T\n"
+               "System time     : %.9O of NTP time\n"
+               "Last offset     : %+.9f seconds\n"
+               "RMS offset      : %.9f seconds\n"
+               "Frequency       : %.3F\n"
+               "Residual freq   : %+.3f ppm\n"
+               "Skew            : %.3f ppm\n"
+               "Root delay      : %.9f seconds\n"
+               "Root dispersion : %.9f seconds\n"
+               "Update interval : %.1f seconds\n"
+               "Leap status     : %L\n",
+               (unsigned long)ref_id, name,
+               ntohs(reply.data.tracking.stratum),
+               &ref_time,
+               UTI_FloatNetworkToHost(reply.data.tracking.current_correction),
+               UTI_FloatNetworkToHost(reply.data.tracking.last_offset),
+               UTI_FloatNetworkToHost(reply.data.tracking.rms_offset),
+               UTI_FloatNetworkToHost(reply.data.tracking.freq_ppm),
+               UTI_FloatNetworkToHost(reply.data.tracking.resid_freq_ppm),
+               UTI_FloatNetworkToHost(reply.data.tracking.skew_ppm),
+               UTI_FloatNetworkToHost(reply.data.tracking.root_delay),
+               UTI_FloatNetworkToHost(reply.data.tracking.root_dispersion),
+               UTI_FloatNetworkToHost(reply.data.tracking.last_update_interval),
+               ntohs(reply.data.tracking.leap_status), REPORT_END);
+
+  return 1;
+}
+
+/* ================================================== */
+
+static int
+process_cmd_ntpdata(char *line)
+{
+  CMD_Request request;
+  CMD_Reply reply;
+  IPAddr remote_addr, local_addr;
+  struct timespec ref_time;
+  uint32_t i, n_sources;
+  uint16_t mode;
+  int specified_addr;
+
+  if (*line) {
+    specified_addr = 1;
+    n_sources = 1;
+  } else {
+    specified_addr = 0;
+    request.command = htons(REQ_N_SOURCES);
+    if (!request_reply(&request, &reply, RPY_N_SOURCES, 0))
+      return 0;
+    n_sources = ntohl(reply.data.n_sources.n_sources);
+  }
+
+  for (i = 0; i < n_sources; i++) {
+    if (specified_addr) {
+      if (DNS_Name2IPAddress(line, &remote_addr, 1) != DNS_Success) {
+        LOG(LOGS_ERR, LOGF_Client, "Could not get address for hostname");
+        return 0;
+      }
     } else {
-      DNS_IPAddress2Name(&ip_addr, host, sizeof (host));
-      ref_ip = host;
-    }
-    
-    switch (ntohs(reply.data.tracking.leap_status)) {
-      case LEAP_Normal:
-        leap_status = "Normal";
-        break;
-      case LEAP_InsertSecond:
-        leap_status = "Insert second";
-        break;
-      case LEAP_DeleteSecond:
-        leap_status = "Delete second";
-        break;
-      case LEAP_Unsynchronised:
-        leap_status = "Not synchronised";
-        break;
-      default:
-        leap_status = "Unknown";
-        break;
+      request.command = htons(REQ_SOURCE_DATA);
+      request.data.source_data.index = htonl(i);
+      if (!request_reply(&request, &reply, RPY_SOURCE_DATA, 0))
+        return 0;
+
+      mode = ntohs(reply.data.source_data.mode);
+      if (mode != RPY_SD_MD_CLIENT && mode != RPY_SD_MD_PEER)
+        continue;
+
+      UTI_IPNetworkToHost(&reply.data.source_data.ip_addr, &remote_addr);
     }
 
-    printf("Reference ID    : %lu.%lu.%lu.%lu (%s)\n", a, b, c, d, ref_ip);
-    printf("Stratum         : %lu\n", (unsigned long) ntohs(reply.data.tracking.stratum));
-    UTI_TimevalNetworkToHost(&reply.data.tracking.ref_time, &ref_time);
-    ref_time_tm = *gmtime((time_t *)&ref_time.tv_sec);
-    printf("Ref time (UTC)  : %s", asctime(&ref_time_tm));
-    correction = UTI_FloatNetworkToHost(reply.data.tracking.current_correction);
-    last_offset = UTI_FloatNetworkToHost(reply.data.tracking.last_offset);
-    rms_offset = UTI_FloatNetworkToHost(reply.data.tracking.rms_offset);
-    printf("System time     : %.9f seconds %s of NTP time\n", fabs(correction),
-           (correction > 0.0) ? "slow" : "fast");
-    printf("Last offset     : %+.9f seconds\n", last_offset);
-    printf("RMS offset      : %.9f seconds\n", rms_offset);
-    freq_ppm = UTI_FloatNetworkToHost(reply.data.tracking.freq_ppm);
-    resid_freq_ppm = UTI_FloatNetworkToHost(reply.data.tracking.resid_freq_ppm);
-    skew_ppm = UTI_FloatNetworkToHost(reply.data.tracking.skew_ppm);
-    root_delay = UTI_FloatNetworkToHost(reply.data.tracking.root_delay);
-    root_dispersion = UTI_FloatNetworkToHost(reply.data.tracking.root_dispersion);
-    last_update_interval = UTI_FloatNetworkToHost(reply.data.tracking.last_update_interval);
-    printf("Frequency       : %.3f ppm %s\n", fabs(freq_ppm), (freq_ppm < 0.0) ? "slow" : "fast"); 
-    printf("Residual freq   : %+.3f ppm\n", resid_freq_ppm);
-    printf("Skew            : %.3f ppm\n", skew_ppm);
-    printf("Root delay      : %.6f seconds\n", root_delay);
-    printf("Root dispersion : %.6f seconds\n", root_dispersion);
-    printf("Update interval : %.1f seconds\n", last_update_interval);
-    printf("Leap status     : %s\n", leap_status);
-    return 1;
+    request.command = htons(REQ_NTP_DATA);
+    UTI_IPHostToNetwork(&remote_addr, &request.data.ntp_data.ip_addr);
+    if (!request_reply(&request, &reply, RPY_NTP_DATA, 0))
+      return 0;
+
+    UTI_IPNetworkToHost(&reply.data.ntp_data.remote_addr, &remote_addr);
+    UTI_IPNetworkToHost(&reply.data.ntp_data.local_addr, &local_addr);
+    UTI_TimespecNetworkToHost(&reply.data.ntp_data.ref_time, &ref_time);
+
+    if (!specified_addr && !csv_mode)
+      printf("\n");
+
+    print_report("Remote address  : %s (%R)\n"
+                 "Remote port     : %u\n"
+                 "Local address   : %s (%R)\n"
+                 "Leap status     : %L\n"
+                 "Version         : %u\n"
+                 "Mode            : %M\n"
+                 "Stratum         : %u\n"
+                 "Poll interval   : %d (%.0f seconds)\n"
+                 "Precision       : %d (%.9f seconds)\n"
+                 "Root delay      : %.6f seconds\n"
+                 "Root dispersion : %.6f seconds\n"
+                 "Reference ID    : %R (%s)\n"
+                 "Reference time  : %T\n"
+                 "Offset          : %+.9f seconds\n"
+                 "Peer delay      : %.9f seconds\n"
+                 "Peer dispersion : %.9f seconds\n"
+                 "Response time   : %.9f seconds\n"
+                 "Jitter asymmetry: %+.2f\n"
+                 "NTP tests       : %.3b %.3b %.4b\n"
+                 "Interleaved     : %B\n"
+                 "Authenticated   : %B\n"
+                 "TX timestamping : %N\n"
+                 "RX timestamping : %N\n"
+                 "Total TX        : %U\n"
+                 "Total RX        : %U\n"
+                 "Total valid RX  : %U\n",
+                 UTI_IPToString(&remote_addr), (unsigned long)UTI_IPToRefid(&remote_addr),
+                 ntohs(reply.data.ntp_data.remote_port),
+                 UTI_IPToString(&local_addr), (unsigned long)UTI_IPToRefid(&local_addr),
+                 reply.data.ntp_data.leap, reply.data.ntp_data.version,
+                 reply.data.ntp_data.mode, reply.data.ntp_data.stratum,
+                 reply.data.ntp_data.poll, UTI_Log2ToDouble(reply.data.ntp_data.poll),
+                 reply.data.ntp_data.precision, UTI_Log2ToDouble(reply.data.ntp_data.precision),
+                 UTI_FloatNetworkToHost(reply.data.ntp_data.root_delay),
+                 UTI_FloatNetworkToHost(reply.data.ntp_data.root_dispersion),
+                 (unsigned long)ntohl(reply.data.ntp_data.ref_id),
+                 reply.data.ntp_data.stratum <= 1 ?
+                   UTI_RefidToString(ntohl(reply.data.ntp_data.ref_id)) : "",
+                 &ref_time,
+                 UTI_FloatNetworkToHost(reply.data.ntp_data.offset),
+                 UTI_FloatNetworkToHost(reply.data.ntp_data.peer_delay),
+                 UTI_FloatNetworkToHost(reply.data.ntp_data.peer_dispersion),
+                 UTI_FloatNetworkToHost(reply.data.ntp_data.response_time),
+                 UTI_FloatNetworkToHost(reply.data.ntp_data.jitter_asymmetry),
+                 ntohs(reply.data.ntp_data.flags) >> 7,
+                 ntohs(reply.data.ntp_data.flags) >> 4,
+                 ntohs(reply.data.ntp_data.flags),
+                 ntohs(reply.data.ntp_data.flags) & RPY_NTP_FLAG_INTERLEAVED,
+                 ntohs(reply.data.ntp_data.flags) & RPY_NTP_FLAG_AUTHENTICATED,
+                 reply.data.ntp_data.tx_tss_char, reply.data.ntp_data.rx_tss_char,
+                 (unsigned long)ntohl(reply.data.ntp_data.total_tx_count),
+                 (unsigned long)ntohl(reply.data.ntp_data.total_rx_count),
+                 (unsigned long)ntohl(reply.data.ntp_data.total_valid_count),
+                 REPORT_END);
   }
-  return 0;
+
+  return 1;
 }
+
+/* ================================================== */
+
+static int
+process_cmd_serverstats(char *line)
+{
+  CMD_Request request;
+  CMD_Reply reply;
+
+  request.command = htons(REQ_SERVER_STATS);
+  if (!request_reply(&request, &reply, RPY_SERVER_STATS, 0))
+    return 0;
+
+  print_report("NTP packets received       : %U\n"
+               "NTP packets dropped        : %U\n"
+               "Command packets received   : %U\n"
+               "Command packets dropped    : %U\n"
+               "Client log records dropped : %U\n",
+               (unsigned long)ntohl(reply.data.server_stats.ntp_hits),
+               (unsigned long)ntohl(reply.data.server_stats.ntp_drops),
+               (unsigned long)ntohl(reply.data.server_stats.cmd_hits),
+               (unsigned long)ntohl(reply.data.server_stats.cmd_drops),
+               (unsigned long)ntohl(reply.data.server_stats.log_drops),
+               REPORT_END);
+
+  return 1;
+}
+
 /* ================================================== */
 
 static int
@@ -1972,34 +2386,29 @@ process_cmd_smoothing(char *line)
   CMD_Request request;
   CMD_Reply reply;
   uint32_t flags;
-  double offset;
-  double freq_ppm;
-  double wander_ppm;
-  double last_update_ago;
-  double remaining_time;
 
   request.command = htons(REQ_SMOOTHING);
+  if (!request_reply(&request, &reply, RPY_SMOOTHING, 0))
+    return 0;
 
-  if (request_reply(&request, &reply, RPY_SMOOTHING, 0)) {
-    flags = ntohl(reply.data.smoothing.flags);
-    offset = UTI_FloatNetworkToHost(reply.data.smoothing.offset);
-    freq_ppm = UTI_FloatNetworkToHost(reply.data.smoothing.freq_ppm);
-    wander_ppm = UTI_FloatNetworkToHost(reply.data.smoothing.wander_ppm);
-    last_update_ago = UTI_FloatNetworkToHost(reply.data.smoothing.last_update_ago);
-    remaining_time = UTI_FloatNetworkToHost(reply.data.smoothing.remaining_time);
+  flags = ntohl(reply.data.smoothing.flags);
 
-    printf("Active         : %s%s\n",
-           flags & RPY_SMT_FLAG_ACTIVE ? "Yes" : "No",
-           flags & RPY_SMT_FLAG_LEAPONLY ? " (leap second only)" : "");
-    printf("Offset         : %+.9f seconds\n", offset);
-    printf("Frequency      : %+.6f ppm\n", freq_ppm);
-    printf("Wander         : %+.6f ppm per second\n", wander_ppm);
-    printf("Last update    : %.1f seconds ago\n", last_update_ago);
-    printf("Remaining time : %.1f seconds\n", remaining_time);
-    return 1;
-  }
+  print_report("Active         : %B %s\n"
+               "Offset         : %+.9f seconds\n"
+               "Frequency      : %+.6f ppm\n"
+               "Wander         : %+.6f ppm per second\n"
+               "Last update    : %.1f seconds ago\n"
+               "Remaining time : %.1f seconds\n",
+               !!(flags & RPY_SMT_FLAG_ACTIVE),
+               flags & RPY_SMT_FLAG_LEAPONLY ? "(leap second only)" : "",
+               UTI_FloatNetworkToHost(reply.data.smoothing.offset),
+               UTI_FloatNetworkToHost(reply.data.smoothing.freq_ppm),
+               UTI_FloatNetworkToHost(reply.data.smoothing.wander_ppm),
+               UTI_FloatNetworkToHost(reply.data.smoothing.last_update_ago),
+               UTI_FloatNetworkToHost(reply.data.smoothing.remaining_time),
+               REPORT_END);
 
-  return 0;
+  return 1;
 }
 
 /* ================================================== */
@@ -2012,7 +2421,7 @@ process_cmd_smoothtime(CMD_Request *msg, const char *line)
   } else if (!strcmp(line, "activate")) {
     msg->data.smoothtime.option = htonl(REQ_SMOOTHTIME_ACTIVATE);
   } else {
-    fprintf(stderr, "Invalid syntax for smoothtime command\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid syntax for smoothtime command");
     return 0;
   }
 
@@ -2028,34 +2437,29 @@ process_cmd_rtcreport(char *line)
 {
   CMD_Request request;
   CMD_Reply reply;
-  struct timeval ref_time;
-  struct tm ref_time_tm;
-  unsigned short n_samples;
-  unsigned short n_runs;
-  unsigned long span_seconds;
-  double coef_seconds_fast;
-  double coef_gain_rate_ppm;
+  struct timespec ref_time;
   
   request.command = htons(REQ_RTCREPORT);
-  if (request_reply(&request, &reply, RPY_RTC, 0)) {
-    UTI_TimevalNetworkToHost(&reply.data.rtc.ref_time, &ref_time);
-    ref_time_tm = *gmtime(&ref_time.tv_sec);
-    n_samples = ntohs(reply.data.rtc.n_samples);
-    n_runs = ntohs(reply.data.rtc.n_runs);
-    span_seconds = ntohl(reply.data.rtc.span_seconds);
-    coef_seconds_fast = UTI_FloatNetworkToHost(reply.data.rtc.rtc_seconds_fast);
-    coef_gain_rate_ppm = UTI_FloatNetworkToHost(reply.data.rtc.rtc_gain_rate_ppm);
-    printf("RTC ref time (UTC) : %s", asctime(&ref_time_tm));
-    printf("Number of samples  : %d\n", n_samples);
-    printf("Number of runs     : %d\n", n_runs);
-    printf("Sample span period : ");
-    print_seconds(span_seconds);
-    printf("\n");
-    printf("RTC is fast by     : %12.6f seconds\n", coef_seconds_fast);
-    printf("RTC gains time at  : %9.3f ppm\n", coef_gain_rate_ppm);
-    return 1;
-  }
-  return 0;
+  if (!request_reply(&request, &reply, RPY_RTC, 0))
+    return 0;
+
+  UTI_TimespecNetworkToHost(&reply.data.rtc.ref_time, &ref_time);
+
+  print_report("RTC ref time (UTC) : %T\n"
+               "Number of samples  : %u\n"
+               "Number of runs     : %u\n"
+               "Sample span period : %I\n"
+               "RTC is fast by     : %12.6f seconds\n"
+               "RTC gains time at  : %9.3f ppm\n",
+               &ref_time,
+               ntohs(reply.data.rtc.n_samples),
+               ntohs(reply.data.rtc.n_runs),
+               (unsigned long)ntohl(reply.data.rtc.span_seconds),
+               UTI_FloatNetworkToHost(reply.data.rtc.rtc_seconds_fast),
+               UTI_FloatNetworkToHost(reply.data.rtc.rtc_gain_rate_ppm),
+               REPORT_END);
+
+  return 1;
 }
 
 /* ================================================== */
@@ -2065,87 +2469,59 @@ process_cmd_clients(char *line)
 {
   CMD_Request request;
   CMD_Reply reply;
-  unsigned long next_index;
-  int j;
   IPAddr ip;
-  unsigned long client_hits;
-  unsigned long peer_hits;
-  unsigned long cmd_hits_auth;
-  unsigned long cmd_hits_normal;
-  unsigned long cmd_hits_bad;
-  unsigned long last_ntp_hit_ago;
-  unsigned long last_cmd_hit_ago;
-  char hostname_buf[50];
-
-  int n_replies;
-  int n_indices_in_table;
+  uint32_t i, n_clients, next_index, n_indices;
+  RPY_ClientAccesses_Client *client;
+  char name[50];
 
   next_index = 0;
 
-  printf("Hostname                   Client    Peer CmdAuth CmdNorm  CmdBad  LstN  LstC\n"
-         "=========================  ======  ======  ======  ======  ======  ====  ====\n");
+  print_header("Hostname                      NTP   Drop Int IntL Last     Cmd   Drop Int  Last");
 
-  do {
-
-    request.command = htons(REQ_CLIENT_ACCESSES_BY_INDEX);
+  while (1) {
+    request.command = htons(REQ_CLIENT_ACCESSES_BY_INDEX2);
     request.data.client_accesses_by_index.first_index = htonl(next_index);
-    request.data.client_accesses_by_index.n_indices = htonl(MAX_CLIENT_ACCESSES);
+    request.data.client_accesses_by_index.n_clients = htonl(MAX_CLIENT_ACCESSES);
 
-    if (request_reply(&request, &reply, RPY_CLIENT_ACCESSES_BY_INDEX, 0)) {
-          n_replies = ntohl(reply.data.client_accesses_by_index.n_clients);
-          n_indices_in_table = ntohl(reply.data.client_accesses_by_index.n_indices);
-          if (n_replies == 0) {
-            goto finished;
-          }
-          for (j=0; j<n_replies; j++) {
-            UTI_IPNetworkToHost(&reply.data.client_accesses_by_index.clients[j].ip, &ip);
-            if (ip.family != IPADDR_UNSPEC) {
-              /* UNSPEC implies that the node could not be found in
-                 the daemon's tables; we shouldn't ever generate this
-                 case, but ignore it if we do.  (In future there might
-                 be a protocol to reset the client logging; if another
-                 administrator runs that while we're doing the clients
-                 command, there will be a race condition that could
-                 cause this). */
-              
-              client_hits = ntohl(reply.data.client_accesses_by_index.clients[j].client_hits);
-              peer_hits = ntohl(reply.data.client_accesses_by_index.clients[j].peer_hits);
-              cmd_hits_auth = ntohl(reply.data.client_accesses_by_index.clients[j].cmd_hits_auth);
-              cmd_hits_normal = ntohl(reply.data.client_accesses_by_index.clients[j].cmd_hits_normal);
-              cmd_hits_bad = ntohl(reply.data.client_accesses_by_index.clients[j].cmd_hits_bad);
-              last_ntp_hit_ago = ntohl(reply.data.client_accesses_by_index.clients[j].last_ntp_hit_ago);
-              last_cmd_hit_ago = ntohl(reply.data.client_accesses_by_index.clients[j].last_cmd_hit_ago);
-
-              if (no_dns) {
-                snprintf(hostname_buf, sizeof(hostname_buf),
-                         "%s", UTI_IPToString(&ip));
-              } else {
-                DNS_IPAddress2Name(&ip, hostname_buf, sizeof(hostname_buf));
-                hostname_buf[25] = 0;
-              }
-              printf("%-25s  %6ld  %6ld  %6ld  %6ld  %6ld  ",
-                     hostname_buf,
-                     client_hits, peer_hits,
-                     cmd_hits_auth, cmd_hits_normal, cmd_hits_bad);
-              print_seconds(last_ntp_hit_ago);
-              printf("  ");
-              print_seconds(last_cmd_hit_ago);
-              printf("\n");
-            }
-          }              
-
-          /* Set the next index to probe based on what the server tells us */
-          next_index = ntohl(reply.data.client_accesses_by_index.next_index);
-          if (next_index >= n_indices_in_table) {
-            goto finished;
-          }
-    } else {
+    if (!request_reply(&request, &reply, RPY_CLIENT_ACCESSES_BY_INDEX2, 0))
       return 0;
-    }
-  } while (1); /* keep going until all subnets have been expanded,
-                  down to single nodes */
 
-finished:
+    n_clients = ntohl(reply.data.client_accesses_by_index.n_clients);
+    n_indices = ntohl(reply.data.client_accesses_by_index.n_indices);
+
+    for (i = 0; i < n_clients && i < MAX_CLIENT_ACCESSES; i++) {
+      client = &reply.data.client_accesses_by_index.clients[i];
+
+      UTI_IPNetworkToHost(&client->ip, &ip);
+
+      /* UNSPEC means the record could not be found in the daemon's tables.
+         We shouldn't ever generate this case, but ignore it if we do. */
+      if (ip.family == IPADDR_UNSPEC)
+        continue;
+
+      format_name(name, sizeof (name), 25, 0, 0, &ip);
+
+      print_report("%-25s  %6U  %5U  %C  %C  %I  %6U  %5U  %C  %I\n",
+                   name,
+                   (unsigned long)ntohl(client->ntp_hits),
+                   (unsigned long)ntohl(client->ntp_drops),
+                   client->ntp_interval,
+                   client->ntp_timeout_interval,
+                   (unsigned long)ntohl(client->last_ntp_hit_ago),
+                   (unsigned long)ntohl(client->cmd_hits),
+                   (unsigned long)ntohl(client->cmd_drops),
+                   client->cmd_interval,
+                   (unsigned long)ntohl(client->last_cmd_hit_ago),
+                   REPORT_END);
+    }
+
+    /* Set the next index to probe based on what the server tells us */
+    next_index = ntohl(reply.data.client_accesses_by_index.next_index);
+
+    if (next_index >= n_indices || n_clients < MAX_CLIENT_ACCESSES)
+      break;
+  }
+
   return 1;
 }
 
@@ -2157,29 +2533,32 @@ process_cmd_manual_list(const char *line)
 {
   CMD_Request request;
   CMD_Reply reply;
-  int n_samples;
+  uint32_t i, n_samples;
   RPY_ManualListSample *sample;
-  int i;
-  struct timeval when;
-  double slewed_offset, orig_offset, residual;
+  struct timespec when;
 
   request.command = htons(REQ_MANUAL_LIST);
-  if (request_reply(&request, &reply, RPY_MANUAL_LIST, 0)) {
-          n_samples = ntohl(reply.data.manual_list.n_samples);
-          printf("210 n_samples = %d\n", n_samples);
-          printf("#    Date     Time(UTC)    Slewed   Original   Residual\n"
-                 "=======================================================\n");
-          for (i=0; i<n_samples; i++) {
-            sample = &reply.data.manual_list.samples[i];
-            UTI_TimevalNetworkToHost(&sample->when, &when);
-            slewed_offset = UTI_FloatNetworkToHost(sample->slewed_offset);
-            orig_offset = UTI_FloatNetworkToHost(sample->orig_offset);
-            residual = UTI_FloatNetworkToHost(sample->residual);
-            printf("%2d %s %10.2f %10.2f %10.2f\n", i, UTI_TimeToLogForm(when.tv_sec), slewed_offset, orig_offset, residual);
-          }
-          return 1;
+  if (!request_reply(&request, &reply, RPY_MANUAL_LIST, 0))
+    return 0;
+
+  n_samples = ntohl(reply.data.manual_list.n_samples);
+  print_info_field("210 n_samples = %lu\n", (unsigned long)n_samples);
+
+  print_header("#    Date     Time(UTC)    Slewed   Original   Residual");
+
+  for (i = 0; i < n_samples; i++) {
+    sample = &reply.data.manual_list.samples[i];
+    UTI_TimespecNetworkToHost(&sample->when, &when);
+
+    print_report("%2d %s %10.2f %10.2f %10.2f\n",
+                 i, UTI_TimeToLogForm(when.tv_sec),
+                 UTI_FloatNetworkToHost(sample->slewed_offset),
+                 UTI_FloatNetworkToHost(sample->orig_offset),
+                 UTI_FloatNetworkToHost(sample->residual),
+                 REPORT_END);
   }
-  return 0;
+
+  return 1;
 }
 
 /* ================================================== */
@@ -2190,9 +2569,8 @@ process_cmd_manual_delete(CMD_Request *msg, const char *line)
   int index;
 
   if (sscanf(line, "%d", &index) != 1) {
-    fprintf(stderr, "Bad syntax for manual delete command\n");
+    LOG(LOGS_ERR, LOGF_Client, "Bad syntax for manual delete command");
     return 0;
-
   }
 
   msg->command = htons(REQ_MANUAL_DELETE);
@@ -2205,7 +2583,7 @@ process_cmd_manual_delete(CMD_Request *msg, const char *line)
 static int
 process_cmd_settime(char *line)
 {
-  struct timeval ts;
+  struct timespec ts;
   time_t now, new_time;
   CMD_Request request;
   CMD_Reply reply;
@@ -2220,8 +2598,8 @@ process_cmd_settime(char *line)
     printf("510 - Could not parse date string\n");
   } else {
     ts.tv_sec = new_time;
-    ts.tv_usec = 0;
-    UTI_TimevalHostToNetwork(&ts, &request.data.settime.ts);
+    ts.tv_nsec = 0;
+    UTI_TimespecHostToNetwork(&ts, &request.data.settime.ts);
     request.command = htons(REQ_SETTIME);
     if (request_reply(&request, &reply, RPY_MANUAL_TIMESTAMP, 1)) {
           offset_cs = ntohl(reply.data.manual_timestamp.centiseconds);
@@ -2254,7 +2632,7 @@ process_cmd_makestep(CMD_Request *msg, char *line)
 
   if (*line) {
     if (sscanf(line, "%lf %d", &threshold, &limit) != 2) {
-      fprintf(stderr, "Bad syntax for makestep command\n");
+      LOG(LOGS_ERR, LOGF_Client, "Bad syntax for makestep command");
       return 0;
     }
     msg->command = htons(REQ_MODIFY_MAKESTEP);
@@ -2274,22 +2652,26 @@ process_cmd_activity(const char *line)
 {
   CMD_Request request;
   CMD_Reply reply;
+
   request.command = htons(REQ_ACTIVITY);
-  if (request_reply(&request, &reply, RPY_ACTIVITY, 1)) {
-        printf(
-               "%ld sources online\n"
-               "%ld sources offline\n"
-               "%ld sources doing burst (return to online)\n"
-               "%ld sources doing burst (return to offline)\n"
-               "%ld sources with unknown address\n",
-                (long) ntohl(reply.data.activity.online),
-                (long) ntohl(reply.data.activity.offline),
-                (long) ntohl(reply.data.activity.burst_online),
-                (long) ntohl(reply.data.activity.burst_offline),
-                (long) ntohl(reply.data.activity.unresolved));
-        return 1;
-  }
-  return 0;
+  if (!request_reply(&request, &reply, RPY_ACTIVITY, 0))
+    return 0;
+
+  print_info_field("200 OK\n");
+
+  print_report("%U sources online\n"
+               "%U sources offline\n"
+               "%U sources doing burst (return to online)\n"
+               "%U sources doing burst (return to offline)\n"
+               "%U sources with unknown address\n",
+               (unsigned long)ntohl(reply.data.activity.online),
+               (unsigned long)ntohl(reply.data.activity.offline),
+               (unsigned long)ntohl(reply.data.activity.burst_online),
+               (unsigned long)ntohl(reply.data.activity.burst_offline),
+               (unsigned long)ntohl(reply.data.activity.unresolved),
+               REPORT_END);
+
+  return 1;
 }
 
 /* ================================================== */
@@ -2319,47 +2701,63 @@ process_cmd_reselect(CMD_Request *msg, char *line)
 
 /* ================================================== */
 
+static void
+process_cmd_refresh(CMD_Request *msg, char *line)
+{
+  msg->command = htons(REQ_REFRESH);
+}
+
+/* ================================================== */
+
 static int
 process_cmd_waitsync(char *line)
 {
   CMD_Request request;
   CMD_Reply reply;
-  uint32_t ref_id, a, b, c, d;
-  double correction, skew_ppm, max_correction, max_skew_ppm;
+  IPAddr ip_addr;
+  uint32_t ref_id;
+  double correction, skew_ppm, max_correction, max_skew_ppm, interval;
   int ret = 0, max_tries, i;
+  struct timeval timeout;
 
   max_tries = 0;
   max_correction = 0.0;
   max_skew_ppm = 0.0;
+  interval = 10.0;
 
-  sscanf(line, "%d %lf %lf", &max_tries, &max_correction, &max_skew_ppm);
+  if (sscanf(line, "%d %lf %lf %lf", &max_tries, &max_correction, &max_skew_ppm, &interval))
+    ;
+
+  /* Don't allow shorter interval than 0.1 seconds */
+  if (interval < 0.1)
+    interval = 0.1;
 
   request.command = htons(REQ_TRACKING);
 
   for (i = 1; ; i++) {
     if (request_reply(&request, &reply, RPY_TRACKING, 0)) {
       ref_id = ntohl(reply.data.tracking.ref_id);
-      a = (ref_id >> 24);
-      b = (ref_id >> 16) & 0xff;
-      c = (ref_id >> 8) & 0xff;
-      d = (ref_id) & 0xff;
+      UTI_IPNetworkToHost(&reply.data.tracking.ip_addr, &ip_addr);
 
       correction = UTI_FloatNetworkToHost(reply.data.tracking.current_correction);
       correction = fabs(correction);
       skew_ppm = UTI_FloatNetworkToHost(reply.data.tracking.skew_ppm);
 
-      printf("try: %d, refid: %d.%d.%d.%d, correction: %.9f, skew: %.3f\n",
-          i, a, b, c, d, correction, skew_ppm);
+      print_report("try: %d, refid: %R, correction: %.9f, skew: %.3f\n",
+                   i, (unsigned long)ref_id, correction, skew_ppm, REPORT_END);
 
-      if (ref_id != 0 && ref_id != 0x7f7f0101L /* LOCAL refid */ &&
+      if ((ip_addr.family != IPADDR_UNSPEC ||
+           (ref_id != 0 && ref_id != 0x7f7f0101L /* LOCAL refid */)) &&
           (max_correction == 0.0 || correction <= max_correction) &&
           (max_skew_ppm == 0.0 || skew_ppm <= max_skew_ppm)) {
         ret = 1;
       }
     }
 
-    if (!ret && (!max_tries || i < max_tries)) {
-      sleep(10);
+    if (!ret && (!max_tries || i < max_tries) && !quit) {
+      UTI_DoubleToTimeval(interval, &timeout);
+      if (select(0, NULL, NULL, NULL, &timeout))
+        break;
     } else {
       break;
     }
@@ -2383,36 +2781,9 @@ process_cmd_dns(const char *line)
   } else if (!strcmp(line, "+n")) {
     no_dns = 0;
   } else {
-    fprintf(stderr, "Unrecognized dns command\n");
+    LOG(LOGS_ERR, LOGF_Client, "Unrecognized dns command");
     return 0;
   }
-  return 1;
-}
-
-/* ================================================== */
-
-static int
-process_cmd_authhash(const char *line)
-{
-  const char *hash_name;
-  int new_hash_id;
-
-  assert(auth_hash_id >= 0);
-  hash_name = line;
-
-  if (!*hash_name) {
-    fprintf(stderr, "Could not parse hash name\n");
-    return 0;
-  }
-
-  new_hash_id = HSH_GetHashId(hash_name);
-  if (new_hash_id < 0) {
-    fprintf(stderr, "Unknown hash name: %s\n", hash_name);
-    return 0;
-  }
-
-  auth_hash_id = new_hash_id;
-
   return 1;
 }
 
@@ -2425,7 +2796,7 @@ process_cmd_timeout(const char *line)
 
   timeout = atoi(line);
   if (timeout < 100) {
-    fprintf(stderr, "Timeout %d is too short\n", timeout);
+    LOG(LOGS_ERR, LOGF_Client, "Timeout %d is too short", timeout);
     return 0;
   }
   initial_timeout = timeout;
@@ -2441,7 +2812,7 @@ process_cmd_retries(const char *line)
 
   retries = atoi(line);
   if (retries < 0) {
-    fprintf(stderr, "Invalid maximum number of retries\n");
+    LOG(LOGS_ERR, LOGF_Client, "Invalid maximum number of retries");
     return 0;
   }
   max_retries = retries;
@@ -2451,7 +2822,41 @@ process_cmd_retries(const char *line)
 /* ================================================== */
 
 static int
-process_line(char *line, int *quit)
+process_cmd_keygen(char *line)
+{
+  char hash_name[17];
+  unsigned char key[512];
+  unsigned int i, length, id = 1, bits = 160;
+
+#ifdef FEAT_SECHASH
+  snprintf(hash_name, sizeof (hash_name), "SHA1");
+#else
+  snprintf(hash_name, sizeof (hash_name), "MD5");
+#endif
+
+  if (sscanf(line, "%u %16s %d", &id, hash_name, &bits))
+    ;
+
+  length = CLAMP(10, (bits + 7) / 8, sizeof (key));
+  if (HSH_GetHashId(hash_name) < 0) {
+    LOG(LOGS_ERR, LOGF_Client, "Unknown hash function %s", hash_name);
+    return 0;
+  }
+
+  UTI_GetRandomBytesUrandom(key, length);
+
+  printf("%u %s HEX:", id, hash_name);
+  for (i = 0; i < length; i++)
+    printf("%02hhX", key[i]);
+  printf("\n");
+
+  return 1;
+}
+
+/* ================================================== */
+
+static int
+process_line(char *line)
 {
   char *command;
   int do_normal_submit;
@@ -2459,7 +2864,6 @@ process_line(char *line, int *quit)
   CMD_Request tx_message;
   CMD_Reply rx_message;
 
-  *quit = 0;
   ret = 0;
 
   do_normal_submit = 1;
@@ -2490,9 +2894,6 @@ process_line(char *line, int *quit)
     } else {
       do_normal_submit = process_cmd_allow(&tx_message, line);
     }
-  } else if (!strcmp(command, "authhash")) {
-    ret = process_cmd_authhash(line);
-    do_normal_submit = 0;
   } else if (!strcmp(command, "burst")) {
     do_normal_submit = process_cmd_burst(&tx_message, line);
   } else if (!strcmp(command, "clients")) {
@@ -2534,12 +2935,15 @@ process_line(char *line, int *quit)
     process_cmd_dump(&tx_message, line);
   } else if (!strcmp(command, "exit")) {
     do_normal_submit = 0;
-    *quit = 1;
+    quit = 1;
     ret = 1;
   } else if (!strcmp(command, "help")) {
     do_normal_submit = 0;
     give_help();
     ret = 1;
+  } else if (!strcmp(command, "keygen")) {
+    ret = process_cmd_keygen(line);
+    do_normal_submit = 0;
   } else if (!strcmp(command, "local")) {
     do_normal_submit = process_cmd_local(&tx_message, line);
   } else if (!strcmp(command, "makestep")) {
@@ -2567,18 +2971,21 @@ process_line(char *line, int *quit)
     do_normal_submit = process_cmd_minpoll(&tx_message, line);
   } else if (!strcmp(command, "minstratum")) {
     do_normal_submit = process_cmd_minstratum(&tx_message, line);
+  } else if (!strcmp(command, "ntpdata")) {
+    do_normal_submit = 0;
+    ret = process_cmd_ntpdata(line);
   } else if (!strcmp(command, "offline")) {
     do_normal_submit = process_cmd_offline(&tx_message, line);
   } else if (!strcmp(command, "online")) {
     do_normal_submit = process_cmd_online(&tx_message, line);
-  } else if (!strcmp(command, "password")) {
-    do_normal_submit = process_cmd_password(&tx_message, line);
   } else if (!strcmp(command, "polltarget")) {
     do_normal_submit = process_cmd_polltarget(&tx_message, line);
   } else if (!strcmp(command, "quit")) {
     do_normal_submit = 0;
-    *quit = 1;
+    quit = 1;
     ret = 1;
+  } else if (!strcmp(command, "refresh")) {
+    process_cmd_refresh(&tx_message, line);
   } else if (!strcmp(command, "rekey")) {
     process_cmd_rekey(&tx_message, line);
   } else if (!strcmp(command, "reselect")) {
@@ -2591,6 +2998,9 @@ process_line(char *line, int *quit)
   } else if (!strcmp(command, "rtcdata")) {
     do_normal_submit = 0;
     ret = process_cmd_rtcreport(line);
+  } else if (!strcmp(command, "serverstats")) {
+    do_normal_submit = 0;
+    ret = process_cmd_serverstats(line);
   } else if (!strcmp(command, "settime")) {
     do_normal_submit = 0;
     ret = process_cmd_settime(line);
@@ -2618,8 +3028,14 @@ process_line(char *line, int *quit)
     do_normal_submit = 0;
   } else if (!strcmp(command, "writertc")) {
     process_cmd_writertc(&tx_message, line);
+  } else if (!strcmp(command, "authhash") ||
+             !strcmp(command, "password")) {
+    /* Warn, but don't return error to not break scripts */
+    LOG(LOGS_WARN, LOGF_Client, "Authentication is no longer supported");
+    do_normal_submit = 0;
+    ret = 1;
   } else {
-    fprintf(stderr, "Unrecognized command\n");
+    LOG(LOGS_ERR, LOGF_Client, "Unrecognized command");
     do_normal_submit = 0;
   }
     
@@ -2634,80 +3050,9 @@ process_line(char *line, int *quit)
 /* ================================================== */
 
 static int
-authenticate_from_config(const char *filename)
-{
-  CMD_Request tx_message;
-  CMD_Reply rx_message;
-  char line[2048], keyfile[2048], *command, *arg, *password;
-  const char *hashname;
-  uint32_t key_id = 0, key_id2;
-  int key_id_valid = 1, ret;
-  FILE *in;
-
-  in = fopen(filename, "r");
-  if (!in) {
-    fprintf(stderr, "Could not open file %s : %s\n", filename, strerror(errno));
-    return 0;
-  }
-
-  *keyfile = '\0';
-  while (fgets(line, sizeof (line), in)) {
-    CPS_NormalizeLine(line);
-    command = line;
-    arg = CPS_SplitWord(line);
-    if (!strcasecmp(command, "keyfile")) {
-      snprintf(keyfile, sizeof (keyfile), "%s", arg);
-    } else if (!strcasecmp(command, "commandkey")) {
-      key_id_valid = sscanf(arg, "%"SCNu32, &key_id) == 1;
-    }
-  }
-  fclose(in);
-
-  if (!*keyfile || !key_id_valid) {
-    fprintf(stderr, "Could not read keyfile or commandkey in file %s\n", filename);
-    return 0;
-  }
-
-  in = fopen(keyfile, "r");
-  if (!in) {
-    fprintf(stderr, "Could not open keyfile %s : %s\n", keyfile, strerror(errno));
-    return 0;
-  }
-
-  key_id2 = key_id + 1;
-  while (fgets(line, sizeof (line), in)) {
-    CPS_NormalizeLine(line);
-    if (!*line || !CPS_ParseKey(line, &key_id2, &hashname, &password))
-      continue;
-    if (key_id == key_id2)
-      break;
-  }
-  fclose(in);
-
-  if (key_id == key_id2) {
-    if (process_cmd_authhash(hashname) &&
-        process_cmd_password(&tx_message, password)) {
-      ret = request_reply(&tx_message, &rx_message, RPY_NULL, 1);
-    } else {
-      ret = 0;
-    }
-  } else {
-    fprintf(stderr, "Could not find key %"PRIu32" in keyfile %s\n", key_id, keyfile);
-    ret = 0;
-  }
-
-  /* Erase password from stack */
-  memset(line, 0, sizeof (line));
-
-  return ret;
-}
-
-/* ================================================== */
-
-static int
 process_args(int argc, char **argv, int multi)
 {
-  int total_length, i, ret, quit;
+  int total_length, i, ret;
   char *line;
 
   total_length = 0;
@@ -2715,7 +3060,7 @@ process_args(int argc, char **argv, int multi)
     total_length += strlen(argv[i]) + 1;
   }
 
-  line = (char *) malloc((2 + total_length) * sizeof(char));
+  line = (char *) Malloc((2 + total_length) * sizeof(char));
 
   for (i = 0; i < argc; i++) {
     line[0] = '\0';
@@ -2729,14 +3074,22 @@ process_args(int argc, char **argv, int multi)
       }
     }
 
-    ret = process_line(line, &quit);
+    ret = process_line(line);
     if (!ret || quit)
       break;
   }
 
-  free(line);
+  Free(line);
 
   return ret;
+}
+
+/* ================================================== */
+
+static void
+signal_handler(int signum)
+{
+  quit = 1;
 }
 
 /* ================================================== */
@@ -2745,7 +3098,7 @@ static void
 display_gpl(void)
 {
     printf("chrony version %s\n"
-           "Copyright (C) 1997-2003, 2007, 2009-2015 Richard P. Curnow and others\n"
+           "Copyright (C) 1997-2003, 2007, 2009-2017 Richard P. Curnow and others\n"
            "chrony comes with ABSOLUTELY NO WARRANTY.  This is free software, and\n"
            "you are welcome to redistribute it under certain conditions.  See the\n"
            "GNU General Public License version 2 for details.\n\n",
@@ -2759,9 +3112,8 @@ main(int argc, char **argv)
 {
   char *line;
   const char *progname = argv[0];
-  const char *hostname = NULL;
-  const char *conf_file = DEFAULT_CONF_FILE;
-  int quit = 0, ret = 1, multi = 0, auto_auth = 0, family = IPADDR_UNSPEC;
+  const char *hostnames = NULL;
+  int ret = 1, multi = 0, family = IPADDR_UNSPEC;
   int port = DEFAULT_CANDM_PORT;
 
   /* Parse command line options */
@@ -2769,7 +3121,7 @@ main(int argc, char **argv)
     if (!strcmp(*argv, "-h")) {
       ++argv, --argc;
       if (*argv) {
-        hostname = *argv;
+        hostnames = *argv;
       }
     } else if (!strcmp(*argv, "-p")) {
       ++argv, --argc;
@@ -2778,11 +3130,13 @@ main(int argc, char **argv)
       }
     } else if (!strcmp(*argv, "-f")) {
       ++argv, --argc;
-      if (*argv) {
-        conf_file = *argv;
-      }
+      /* For compatibility */
     } else if (!strcmp(*argv, "-a")) {
-      auto_auth = 1;
+      /* For compatibility */
+    } else if (!strcmp(*argv, "-c")) {
+      csv_mode = 1;
+    } else if (!strcmp(*argv, "-d")) {
+      log_debug_enabled = 1;
     } else if (!strcmp(*argv, "-m")) {
       multi = 1;
     } else if (!strcmp(*argv, "-n")) {
@@ -2795,8 +3149,9 @@ main(int argc, char **argv)
       printf("chronyc (chrony) version %s (%s)\n", CHRONY_VERSION, CHRONYC_FEATURES);
       return 0;
     } else if (!strncmp(*argv, "-", 1)) {
-      fprintf(stderr, "Usage: %s [-h HOST] [-p PORT] [-n] [-4|-6] [-a] [-f FILE] [-m] [COMMAND]\n",
-              progname);
+      LOG(LOGS_ERR, LOGF_Client,
+          "Usage: %s [-h HOST] [-p PORT] [-n] [-c] [-d] [-4|-6] [-m] [COMMAND]",
+          progname);
       return 1;
     } else {
       break; /* And process remainder of line as a command */
@@ -2810,38 +3165,27 @@ main(int argc, char **argv)
   if (on_terminal && (argc == 0)) {
     display_gpl();
   }
-
-  /* MD5 is the default authentication hash */
-  auth_hash_id = HSH_GetHashId("MD5");
-  if (auth_hash_id < 0) {
-    fprintf(stderr, "Could not initialize MD5\n");
-    return 1;
-  }
   
   DNS_SetAddressFamily(family);
 
-  if (!hostname) {
-    hostname = family == IPADDR_INET6 ? "::1" : "127.0.0.1";
-#ifdef FEAT_ASYNCDNS
-    initial_timeout /= 10;
-#endif
+  if (!hostnames) {
+    hostnames = DEFAULT_COMMAND_SOCKET",127.0.0.1,::1";
   }
 
-  open_io(hostname, port);
+  UTI_SetQuitSignalsHandler(signal_handler);
 
-  if (auto_auth) {
-    ret = authenticate_from_config(conf_file);
-  }
+  sockaddrs = get_sockaddrs(hostnames, port);
 
-  if (!ret) {
-    ;
-  } else if (argc > 0) {
+  if (!open_io())
+    LOG_FATAL(LOGF_Client, "Could not open connection to daemon");
+
+  if (argc > 0) {
     ret = process_args(argc, argv, multi);
   } else {
     do {
       line = read_line();
-      if (line) {
-        ret = process_line(line, &quit);
+      if (line && !quit) {
+        ret = process_line(line);
       }else {
 	/* supply the final '\n' when user exits via ^D */
         if( on_terminal ) printf("\n");
@@ -2851,7 +3195,7 @@ main(int argc, char **argv)
 
   close_io();
 
-  free(password);
+  ARR_DestroyInstance(sockaddrs);
 
   return !ret;
 }

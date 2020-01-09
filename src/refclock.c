@@ -2,7 +2,7 @@
   chronyd/chronyc - Programs for keeping computer clocks accurate.
 
  **********************************************************************
- * Copyright (C) Miroslav Lichvar  2009-2011, 2013-2014
+ * Copyright (C) Miroslav Lichvar  2009-2011, 2013-2014, 2016
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -48,7 +48,7 @@ extern RefclockDriver RCL_PHC_driver;
 struct FilterSample {
   double offset;
   double dispersion;
-  struct timeval sample_time;
+  struct timespec sample_time;
 };
 
 struct MedianFilter {
@@ -77,6 +77,7 @@ struct RCL_Instance_Record {
   int leap_status;
   int pps_rate;
   int pps_active;
+  int max_lock_age;
   struct MedianFilter filter;
   uint32_t ref_id;
   uint32_t lock_ref;
@@ -87,40 +88,41 @@ struct RCL_Instance_Record {
   SRC_Instance source;
 };
 
-/* Array of RCL_Instance_Record */
+/* Array of pointers to RCL_Instance_Record */
 static ARR_Instance refclocks;
 
 static LOG_FileID logfileid;
 
-static int valid_sample_time(RCL_Instance instance, struct timeval *tv);
-static int pps_stratum(RCL_Instance instance, struct timeval *tv);
+static int valid_sample_time(RCL_Instance instance, struct timespec *raw, struct timespec *cooked);
+static int pps_stratum(RCL_Instance instance, struct timespec *ts);
 static void poll_timeout(void *arg);
-static void slew_samples(struct timeval *raw, struct timeval *cooked, double dfreq,
+static void slew_samples(struct timespec *raw, struct timespec *cooked, double dfreq,
              double doffset, LCL_ChangeType change_type, void *anything);
 static void add_dispersion(double dispersion, void *anything);
-static void log_sample(RCL_Instance instance, struct timeval *sample_time, int filtered, int pulse, double raw_offset, double cooked_offset, double dispersion);
+static void log_sample(RCL_Instance instance, struct timespec *sample_time, int filtered, int pulse, double raw_offset, double cooked_offset, double dispersion);
 
 static void filter_init(struct MedianFilter *filter, int length, double max_dispersion);
 static void filter_fini(struct MedianFilter *filter);
 static void filter_reset(struct MedianFilter *filter);
 static double filter_get_avg_sample_dispersion(struct MedianFilter *filter);
-static void filter_add_sample(struct MedianFilter *filter, struct timeval *sample_time, double offset, double dispersion);
-static int filter_get_last_sample(struct MedianFilter *filter, struct timeval *sample_time, double *offset, double *dispersion);
+static void filter_add_sample(struct MedianFilter *filter, struct timespec *sample_time, double offset, double dispersion);
+static int filter_get_last_sample(struct MedianFilter *filter, struct timespec *sample_time, double *offset, double *dispersion);
+static int filter_get_samples(struct MedianFilter *filter);
 static int filter_select_samples(struct MedianFilter *filter);
-static int filter_get_sample(struct MedianFilter *filter, struct timeval *sample_time, double *offset, double *dispersion);
-static void filter_slew_samples(struct MedianFilter *filter, struct timeval *when, double dfreq, double doffset);
+static int filter_get_sample(struct MedianFilter *filter, struct timespec *sample_time, double *offset, double *dispersion);
+static void filter_slew_samples(struct MedianFilter *filter, struct timespec *when, double dfreq, double doffset);
 static void filter_add_dispersion(struct MedianFilter *filter, double dispersion);
 
 static RCL_Instance
 get_refclock(unsigned int index)
 {
-  return (RCL_Instance)ARR_GetElement(refclocks, index);
+  return *(RCL_Instance *)ARR_GetElement(refclocks, index);
 }
 
 void
 RCL_Initialise(void)
 {
-  refclocks = ARR_CreateInstance(sizeof (struct RCL_Instance_Record));
+  refclocks = ARR_CreateInstance(sizeof (RCL_Instance));
 
   CNF_AddRefclocks();
 
@@ -148,6 +150,7 @@ RCL_Finalise(void)
     filter_fini(&inst->filter);
     Free(inst->driver_parameter);
     SRC_DestroyInstance(inst->source);
+    Free(inst);
   }
 
   if (ARR_GetSize(refclocks) > 0) {
@@ -162,8 +165,10 @@ int
 RCL_AddRefclock(RefclockParameters *params)
 {
   int pps_source = 0;
+  RCL_Instance inst;
 
-  RCL_Instance inst = ARR_GetNewElement(refclocks);
+  inst = MallocNew(struct RCL_Instance_Record);
+  *(RCL_Instance *)ARR_GetNewElement(refclocks) = inst;
 
   if (strcmp(params->driver_name, "SHM") == 0) {
     inst->driver = &RCL_SHM_driver;
@@ -198,6 +203,7 @@ RCL_AddRefclock(RefclockParameters *params)
   inst->leap_status = LEAP_Normal;
   inst->pps_rate = params->pps_rate;
   inst->pps_active = 0;
+  inst->max_lock_age = params->max_lock_age;
   inst->lock_ref = params->lock_ref_id;
   inst->offset = params->offset;
   inst->delay = params->delay;
@@ -233,7 +239,7 @@ RCL_AddRefclock(RefclockParameters *params)
     if (index >= 10)
       ref[2] = (index / 10) % 10 + '0';
 
-    inst->ref_id = ref[0] << 24 | ref[1] << 16 | ref[2] << 8 | ref[3];
+    inst->ref_id = (uint32_t)ref[0] << 24 | ref[1] << 16 | ref[2] << 8 | ref[3];
   }
 
   if (inst->driver->poll) {
@@ -260,7 +266,7 @@ RCL_AddRefclock(RefclockParameters *params)
 
   filter_init(&inst->filter, params->filter_length, params->max_dispersion);
 
-  inst->source = SRC_CreateNewInstance(inst->ref_id, SRC_REFCLOCK, params->sel_option, NULL,
+  inst->source = SRC_CreateNewInstance(inst->ref_id, SRC_REFCLOCK, params->sel_options, NULL,
                                        params->min_samples, params->max_samples);
 
   DEBUG_LOG(LOGF_Refclock, "refclock %s refid=%s poll=%d dpoll=%d filter=%d",
@@ -296,7 +302,7 @@ RCL_StartRefclocks(void)
 }
 
 void
-RCL_ReportSource(RPT_SourceReport *report, struct timeval *now)
+RCL_ReportSource(RPT_SourceReport *report, struct timespec *now)
 {
   unsigned int i;
   uint32_t ref_id;
@@ -358,21 +364,19 @@ RCL_GetDriverOption(RCL_Instance instance, char *name)
 }
 
 int
-RCL_AddSample(RCL_Instance instance, struct timeval *sample_time, double offset, int leap)
+RCL_AddSample(RCL_Instance instance, struct timespec *sample_time, double offset, int leap)
 {
   double correction, dispersion;
-  struct timeval cooked_time;
+  struct timespec cooked_time;
 
   LCL_GetOffsetCorrection(sample_time, &correction, &dispersion);
-  UTI_AddDoubleToTimeval(sample_time, correction, &cooked_time);
+  UTI_AddDoubleToTimespec(sample_time, correction, &cooked_time);
   dispersion += instance->precision;
 
   /* Make sure the timestamp and offset provided by the driver are sane */
   if (!UTI_IsTimeOffsetSane(sample_time, offset) ||
-      !valid_sample_time(instance, sample_time))
+      !valid_sample_time(instance, sample_time, &cooked_time))
     return 0;
-
-  filter_add_sample(&instance->filter, &cooked_time, offset - correction + instance->offset, dispersion);
 
   switch (leap) {
     case LEAP_Normal:
@@ -381,10 +385,11 @@ RCL_AddSample(RCL_Instance instance, struct timeval *sample_time, double offset,
       instance->leap_status = leap;
       break;
     default:
-      instance->leap_status = LEAP_Unsynchronised;
-      break;
+      DEBUG_LOG(LOGF_Refclock, "refclock sample ignored bad leap %d", leap);
+      return 0;
   }
 
+  filter_add_sample(&instance->filter, &cooked_time, offset - correction + instance->offset, dispersion);
   instance->pps_active = 0;
 
   log_sample(instance, &cooked_time, 0, 0, offset, offset - correction + instance->offset, dispersion);
@@ -397,20 +402,20 @@ RCL_AddSample(RCL_Instance instance, struct timeval *sample_time, double offset,
 }
 
 int
-RCL_AddPulse(RCL_Instance instance, struct timeval *pulse_time, double second)
+RCL_AddPulse(RCL_Instance instance, struct timespec *pulse_time, double second)
 {
   double correction, dispersion, offset;
-  struct timeval cooked_time;
+  struct timespec cooked_time;
   int rate;
   NTP_Leap leap;
 
   leap = LEAP_Normal;
   LCL_GetOffsetCorrection(pulse_time, &correction, &dispersion);
-  UTI_AddDoubleToTimeval(pulse_time, correction, &cooked_time);
+  UTI_AddDoubleToTimespec(pulse_time, correction, &cooked_time);
   dispersion += instance->precision;
 
   if (!UTI_IsTimeOffsetSane(pulse_time, 0.0) ||
-      !valid_sample_time(instance, pulse_time))
+      !valid_sample_time(instance, pulse_time, &cooked_time))
     return 0;
 
   rate = instance->pps_rate;
@@ -427,7 +432,7 @@ RCL_AddPulse(RCL_Instance instance, struct timeval *pulse_time, double second)
 
   if (instance->lock_ref != -1) {
     RCL_Instance lock_refclock;
-    struct timeval ref_sample_time;
+    struct timespec ref_sample_time;
     double sample_diff, ref_offset, ref_dispersion, shift;
 
     lock_refclock = get_refclock(instance->lock_ref);
@@ -440,8 +445,8 @@ RCL_AddPulse(RCL_Instance instance, struct timeval *pulse_time, double second)
 
     ref_dispersion += filter_get_avg_sample_dispersion(&lock_refclock->filter);
 
-    UTI_DiffTimevalsToDouble(&sample_diff, &cooked_time, &ref_sample_time);
-    if (fabs(sample_diff) >= 2.0 / rate) {
+    sample_diff = UTI_DiffTimespecsToDouble(&cooked_time, &ref_sample_time);
+    if (fabs(sample_diff) >= (double)instance->max_lock_age / rate) {
       DEBUG_LOG(LOGF_Refclock, "refclock pulse ignored samplediff=%.9f",
           sample_diff);
       return 0;
@@ -466,20 +471,21 @@ RCL_AddPulse(RCL_Instance instance, struct timeval *pulse_time, double second)
     DEBUG_LOG(LOGF_Refclock, "refclock pulse second=%.9f offset=%.9f offdiff=%.9f samplediff=%.9f",
         second, offset, ref_offset - offset, sample_diff);
   } else {
-    struct timeval ref_time;
+    struct timespec ref_time;
     int is_synchronised, stratum;
     double root_delay, root_dispersion, distance;
     uint32_t ref_id;
 
-    /* Ignore the pulse if we are not well synchronized */
+    /* Ignore the pulse if we are not well synchronized and the local
+       reference is not active */
 
     REF_GetReferenceParams(&cooked_time, &is_synchronised, &leap, &stratum,
         &ref_id, &ref_time, &root_delay, &root_dispersion);
     distance = fabs(root_delay) / 2 + root_dispersion;
 
-    if (!is_synchronised || distance >= 0.5 / rate) {
+    if (leap == LEAP_Unsynchronised || distance >= 0.5 / rate) {
       DEBUG_LOG(LOGF_Refclock, "refclock pulse ignored second=%.9f sync=%d dist=%.9f",
-          second, is_synchronised, distance);
+          second, leap != LEAP_Unsynchronised, distance);
       /* Drop also all stored samples */
       filter_reset(&instance->filter);
       return 0;
@@ -499,26 +505,39 @@ RCL_AddPulse(RCL_Instance instance, struct timeval *pulse_time, double second)
   return 1;
 }
 
-static int
-valid_sample_time(RCL_Instance instance, struct timeval *tv)
+double
+RCL_GetPrecision(RCL_Instance instance)
 {
-  struct timeval raw_time;
-  double diff;
+  return instance->precision;
+}
 
-  LCL_ReadRawTime(&raw_time);
-  UTI_DiffTimevalsToDouble(&diff, &raw_time, tv);
-  if (diff < 0.0 || diff > UTI_Log2ToDouble(instance->poll + 1)) {
-    DEBUG_LOG(LOGF_Refclock, "%s refclock sample not valid age=%.6f tv=%s",
-        UTI_RefidToString(instance->ref_id), diff, UTI_TimevalToString(tv));
+static int
+valid_sample_time(RCL_Instance instance, struct timespec *raw, struct timespec *cooked)
+{
+  struct timespec now_raw, last_sample_time;
+  double diff, last_offset, last_dispersion;
+
+  LCL_ReadRawTime(&now_raw);
+  diff = UTI_DiffTimespecsToDouble(&now_raw, raw);
+
+  if (diff < 0.0 || diff > UTI_Log2ToDouble(instance->poll + 1) ||
+      (filter_get_samples(&instance->filter) > 0 &&
+       filter_get_last_sample(&instance->filter, &last_sample_time,
+                              &last_offset, &last_dispersion) &&
+       UTI_CompareTimespecs(&last_sample_time, cooked) >= 0)) {
+    DEBUG_LOG(LOGF_Refclock, "%s refclock sample not valid age=%.6f raw=%s cooked=%s",
+              UTI_RefidToString(instance->ref_id), diff,
+              UTI_TimespecToString(raw), UTI_TimespecToString(cooked));
     return 0;
   }
+
   return 1;
 }
 
 static int
-pps_stratum(RCL_Instance instance, struct timeval *tv)
+pps_stratum(RCL_Instance instance, struct timespec *ts)
 {
-  struct timeval ref_time;
+  struct timespec ref_time;
   int is_synchronised, stratum;
   unsigned int i;
   double root_delay, root_dispersion;
@@ -526,12 +545,13 @@ pps_stratum(RCL_Instance instance, struct timeval *tv)
   uint32_t ref_id;
   RCL_Instance refclock;
 
-  REF_GetReferenceParams(tv, &is_synchronised, &leap, &stratum,
+  REF_GetReferenceParams(ts, &is_synchronised, &leap, &stratum,
       &ref_id, &ref_time, &root_delay, &root_dispersion);
 
-  /* Don't change our stratum if local stratum is active
+  /* Don't change our stratum if the local reference is active
      or this is the current source */
-  if (ref_id == instance->ref_id || REF_IsLocalActive())
+  if (ref_id == instance->ref_id ||
+      (!is_synchronised && leap != LEAP_Unsynchronised))
     return stratum - 1;
 
   /* Or the current source is another PPS refclock */ 
@@ -562,7 +582,7 @@ poll_timeout(void *arg)
   
   if (!(inst->driver->poll && inst->driver_polled < (1 << (inst->poll - inst->driver_poll)))) {
     double offset, dispersion;
-    struct timeval sample_time;
+    struct timespec sample_time;
     int sample_ok, stratum;
 
     sample_ok = filter_get_sample(&inst->filter, &sample_time, &offset, &dispersion);
@@ -590,7 +610,7 @@ poll_timeout(void *arg)
 }
 
 static void
-slew_samples(struct timeval *raw, struct timeval *cooked, double dfreq,
+slew_samples(struct timespec *raw, struct timespec *cooked, double dfreq,
              double doffset, LCL_ChangeType change_type, void *anything)
 {
   unsigned int i;
@@ -613,7 +633,7 @@ add_dispersion(double dispersion, void *anything)
 }
 
 static void
-log_sample(RCL_Instance instance, struct timeval *sample_time, int filtered, int pulse, double raw_offset, double cooked_offset, double dispersion)
+log_sample(RCL_Instance instance, struct timespec *sample_time, int filtered, int pulse, double raw_offset, double cooked_offset, double dispersion)
 {
   char sync_stats[4] = {'N', '+', '-', '?'};
 
@@ -623,7 +643,7 @@ log_sample(RCL_Instance instance, struct timeval *sample_time, int filtered, int
   if (!filtered) {
     LOG_FileWrite(logfileid, "%s.%06d %-5s %3d %1c %1d %13.6e %13.6e %10.3e",
       UTI_TimeToLogForm(sample_time->tv_sec),
-      (int)sample_time->tv_usec,
+      (int)sample_time->tv_nsec / 1000,
       UTI_RefidToString(instance->ref_id),
       instance->driver_polled,
       sync_stats[instance->leap_status],
@@ -634,7 +654,7 @@ log_sample(RCL_Instance instance, struct timeval *sample_time, int filtered, int
   } else {
     LOG_FileWrite(logfileid, "%s.%06d %-5s   - %1c -       -       %13.6e %10.3e",
       UTI_TimeToLogForm(sample_time->tv_sec),
-      (int)sample_time->tv_usec,
+      (int)sample_time->tv_nsec / 1000,
       UTI_RefidToString(instance->ref_id),
       sync_stats[instance->leap_status],
       cooked_offset,
@@ -687,7 +707,7 @@ filter_get_avg_sample_dispersion(struct MedianFilter *filter)
 }
 
 static void
-filter_add_sample(struct MedianFilter *filter, struct timeval *sample_time, double offset, double dispersion)
+filter_add_sample(struct MedianFilter *filter, struct timespec *sample_time, double offset, double dispersion)
 {
   filter->index++;
   filter->index %= filter->length;
@@ -700,11 +720,11 @@ filter_add_sample(struct MedianFilter *filter, struct timeval *sample_time, doub
   filter->samples[filter->index].dispersion = dispersion;
 
   DEBUG_LOG(LOGF_Refclock, "filter sample %d t=%s offset=%.9f dispersion=%.9f",
-      filter->index, UTI_TimevalToString(sample_time), offset, dispersion);
+      filter->index, UTI_TimespecToString(sample_time), offset, dispersion);
 }
 
 static int
-filter_get_last_sample(struct MedianFilter *filter, struct timeval *sample_time, double *offset, double *dispersion)
+filter_get_last_sample(struct MedianFilter *filter, struct timespec *sample_time, double *offset, double *dispersion)
 {
   if (filter->last < 0)
     return 0;
@@ -713,6 +733,12 @@ filter_get_last_sample(struct MedianFilter *filter, struct timeval *sample_time,
   *offset = filter->samples[filter->last].offset;
   *dispersion = filter->samples[filter->last].dispersion;
   return 1;
+}
+
+static int
+filter_get_samples(struct MedianFilter *filter)
+{
+  return filter->used;
 }
 
 static const struct FilterSample *tmp_sorted_array;
@@ -817,7 +843,7 @@ filter_select_samples(struct MedianFilter *filter)
 }
 
 static int
-filter_get_sample(struct MedianFilter *filter, struct timeval *sample_time, double *offset, double *dispersion)
+filter_get_sample(struct MedianFilter *filter, struct timespec *sample_time, double *offset, double *dispersion)
 {
   struct FilterSample *s, *ls;
   int i, n, dof;
@@ -834,7 +860,7 @@ filter_get_sample(struct MedianFilter *filter, struct timeval *sample_time, doub
   for (i = 0; i < n; i++) {
     s = &filter->samples[filter->selected[i]];
 
-    UTI_DiffTimevalsToDouble(&filter->x_data[i], &s->sample_time, &ls->sample_time);
+    filter->x_data[i] = UTI_DiffTimespecsToDouble(&s->sample_time, &ls->sample_time);
     filter->y_data[i] = s->offset;
     filter->w_data[i] = s->dispersion;
   }
@@ -909,7 +935,7 @@ filter_get_sample(struct MedianFilter *filter, struct timeval *sample_time, doub
   if (d < e)
     d = e;
 
-  UTI_AddDoubleToTimeval(&ls->sample_time, x, sample_time);
+  UTI_AddDoubleToTimespec(&ls->sample_time, x, sample_time);
   *offset = y;
   *dispersion = d;
 
@@ -919,15 +945,26 @@ filter_get_sample(struct MedianFilter *filter, struct timeval *sample_time, doub
 }
 
 static void
-filter_slew_samples(struct MedianFilter *filter, struct timeval *when, double dfreq, double doffset)
+filter_slew_samples(struct MedianFilter *filter, struct timespec *when, double dfreq, double doffset)
 {
-  int i;
+  int i, first, last;
   double delta_time;
-  struct timeval *sample;
+  struct timespec *sample;
 
-  for (i = 0; i < filter->used; i++) {
+  if (filter->last < 0)
+    return;
+
+  /* always slew the last sample as it may be needed by PPS refclocks */
+  if (filter->used > 0) {
+    first = 0;
+    last = filter->used - 1;
+  } else {
+    first = last = filter->last;
+  }
+
+  for (i = first; i <= last; i++) {
     sample = &filter->samples[i].sample_time;
-    UTI_AdjustTimeval(sample, when, sample, &delta_time, dfreq, doffset);
+    UTI_AdjustTimespec(sample, when, sample, &delta_time, dfreq, doffset);
     filter->samples[i].offset -= delta_time;
   }
 }

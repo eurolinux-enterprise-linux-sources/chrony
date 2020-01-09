@@ -31,20 +31,19 @@
 #include "nameserv_async.h"
 #include "logging.h"
 #include "memory.h"
+#include "privops.h"
 #include "sched.h"
 #include "util.h"
 
 #ifdef USE_PTHREAD_ASYNCDNS
 #include <pthread.h>
 
-#define MAX_ADDRESSES 16
-
 /* ================================================== */
 
 struct DNS_Async_Instance {
   const char *name;
   DNS_Status status;
-  IPAddr addresses[MAX_ADDRESSES];
+  IPAddr addresses[DNS_MAX_ADDRESSES];
   DNS_NameResolveHandler handler;
   void *arg;
 
@@ -61,7 +60,7 @@ start_resolving(void *anything)
 {
   struct DNS_Async_Instance *inst = (struct DNS_Async_Instance *)anything;
 
-  inst->status = DNS_Name2IPAddress(inst->name, inst->addresses, MAX_ADDRESSES);
+  inst->status = PRV_Name2IPAddress(inst->name, inst->addresses, DNS_MAX_ADDRESSES);
 
   /* Notify the main thread that the result is ready */
   if (write(inst->pipe[1], "", 1) < 0)
@@ -73,7 +72,7 @@ start_resolving(void *anything)
 /* ================================================== */
 
 static void
-end_resolving(void *anything)
+end_resolving(int fd, int event, void *anything)
 {
   struct DNS_Async_Instance *inst = (struct DNS_Async_Instance *)anything;
   int i;
@@ -84,11 +83,11 @@ end_resolving(void *anything)
 
   resolving_threads--;
 
-  SCH_RemoveInputFileHandler(inst->pipe[0]);
+  SCH_RemoveFileHandler(inst->pipe[0]);
   close(inst->pipe[0]);
   close(inst->pipe[1]);
 
-  for (i = 0; inst->status == DNS_Success && i < MAX_ADDRESSES &&
+  for (i = 0; inst->status == DNS_Success && i < DNS_MAX_ADDRESSES &&
               inst->addresses[i].family != IPADDR_UNSPEC; i++)
     ;
 
@@ -114,6 +113,9 @@ DNS_Name2IPAddressAsync(const char *name, DNS_NameResolveHandler handler, void *
     LOG_FATAL(LOGF_Nameserv, "pipe() failed");
   }
 
+  UTI_FdSetCloexec(inst->pipe[0]);
+  UTI_FdSetCloexec(inst->pipe[1]);
+
   resolving_threads++;
   assert(resolving_threads <= 1);
 
@@ -121,7 +123,7 @@ DNS_Name2IPAddressAsync(const char *name, DNS_NameResolveHandler handler, void *
     LOG_FATAL(LOGF_Nameserv, "pthread_create() failed");
   }
 
-  SCH_AddInputFileHandler(inst->pipe[0], end_resolving, inst);
+  SCH_AddFileHandler(inst->pipe[0], SCH_FILE_INPUT, end_resolving, inst);
 }
 
 /* ================================================== */

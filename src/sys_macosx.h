@@ -23,15 +23,16 @@
 
   =======================================================================
 
-  Header file for MacOS X driver
+  Header file for macOS driver
 
   */
 
 #ifndef GOT_SYS_MACOSX_H
 #define GOT_SYS_MACOSX_H
 
+void SYS_MacOSX_SetScheduler(int SchedPriority);
+void SYS_MacOSX_DropRoot(uid_t uid, gid_t gid);
 void SYS_MacOSX_Initialise(void);
-
 void SYS_MacOSX_Finalise(void);
 
 #endif

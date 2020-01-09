@@ -93,17 +93,17 @@ static double max_freq;
 /* Frequency offset, time offset and the time of the last smoothing update */
 static double smooth_freq;
 static double smooth_offset;
-static struct timeval last_update;
+static struct timespec last_update;
 
 
 static void
-get_smoothing(struct timeval *now, double *poffset, double *pfreq,
+get_smoothing(struct timespec *now, double *poffset, double *pfreq,
               double *pwander)
 {
   double elapsed, length, offset, freq, wander;
   int i;
 
-  UTI_DiffTimevalsToDouble(&elapsed, now, &last_update);
+  elapsed = UTI_DiffTimespecsToDouble(now, &last_update);
 
   offset = smooth_offset;
   freq = smooth_freq;
@@ -137,7 +137,7 @@ get_smoothing(struct timeval *now, double *poffset, double *pfreq,
 static void
 update_stages(void)
 {
-  double s1, s2, s, l1, l2, l3, lc, f, f2;
+  double s1, s2, s, l1, l2, l3, lc, f, f2, l1t[2], l3t[2], err[2];
   int i, dir;
 
   /* Prepare the three stages so that the integral of the frequency offset
@@ -146,22 +146,41 @@ update_stages(void)
   s1 = smooth_offset / max_wander;
   s2 = smooth_freq * smooth_freq / (2.0 * max_wander * max_wander);
   
-  l1 = l2 = l3 = 0.0;
-
   /* Calculate the lengths of the 1st and 3rd stage assuming there is no
-     frequency limit.  If length of the 1st stage comes out negative, switch
-     its direction. */
-  for (dir = -1; dir <= 1; dir += 2) {
+     frequency limit.  The direction of the 1st stage is selected so that
+     the lengths will not be negative.  With extremely small offsets both
+     directions may give a negative length due to numerical errors, so select
+     the one which gives a smaller error. */
+
+  for (i = 0, dir = -1; i <= 1; i++, dir += 2) {
+    err[i] = 0.0;
     s = dir * s1 + s2;
-    if (s >= 0.0) {
-      l3 = sqrt(s);
-      l1 = l3 - dir * smooth_freq / max_wander;
-      if (l1 >= 0.0)
-        break;
+
+    if (s < 0.0) {
+      err[i] += -s;
+      s = 0.0;
+    }
+
+    l3t[i] = sqrt(s);
+    l1t[i] = l3t[i] - dir * smooth_freq / max_wander;
+
+    if (l1t[i] < 0.0) {
+      err[i] += l1t[i] * l1t[i];
+      l1t[i] = 0.0;
     }
   }
 
-  assert(dir <= 1 && l1 >= 0.0 && l3 >= 0.0);
+  if (err[0] < err[1]) {
+    l1 = l1t[0];
+    l3 = l3t[0];
+    dir = -1;
+  } else {
+    l1 = l1t[1];
+    l3 = l3t[1];
+    dir = 1;
+  }
+
+  l2 = 0.0;
 
   /* If the limit was reached, shorten 1st+3rd stages and set a 2nd stage */
   f = dir * smooth_freq + l1 * max_wander - max_freq;
@@ -195,7 +214,7 @@ update_stages(void)
 }
 
 static void
-update_smoothing(struct timeval *now, double offset, double freq)
+update_smoothing(struct timespec *now, double offset, double freq)
 {
   /* Don't accept offset/frequency until the clock has stabilized */
   if (locked) {
@@ -215,7 +234,7 @@ update_smoothing(struct timeval *now, double offset, double freq)
 }
 
 static void
-handle_slew(struct timeval *raw, struct timeval *cooked, double dfreq,
+handle_slew(struct timespec *raw, struct timespec *cooked, double dfreq,
             double doffset, LCL_ChangeType change_type, void *anything)
 {
   double delta;
@@ -227,7 +246,7 @@ handle_slew(struct timeval *raw, struct timeval *cooked, double dfreq,
       update_smoothing(cooked, doffset, dfreq);
   }
 
-  UTI_AdjustTimeval(&last_update, cooked, &last_update, &delta, dfreq, doffset);
+  UTI_AdjustTimespec(&last_update, cooked, &last_update, &delta, dfreq, doffset);
 }
 
 void SMT_Initialise(void)
@@ -258,7 +277,7 @@ int SMT_IsEnabled(void)
 }
 
 double
-SMT_GetOffset(struct timeval *now)
+SMT_GetOffset(struct timespec *now)
 {
   double offset, freq;
 
@@ -271,7 +290,7 @@ SMT_GetOffset(struct timeval *now)
 }
 
 void
-SMT_Activate(struct timeval *now)
+SMT_Activate(struct timespec *now)
 {
   if (!enabled || !locked)
     return;
@@ -283,7 +302,7 @@ SMT_Activate(struct timeval *now)
 }
 
 void
-SMT_Reset(struct timeval *now)
+SMT_Reset(struct timespec *now)
 {
   int i;
 
@@ -299,7 +318,7 @@ SMT_Reset(struct timeval *now)
 }
 
 void
-SMT_Leap(struct timeval *now, int leap)
+SMT_Leap(struct timespec *now, int leap)
 {
   /* When the leap-only mode is disabled, the leap second will be accumulated
      in handle_slew() as a normal offset */
@@ -310,7 +329,7 @@ SMT_Leap(struct timeval *now, int leap)
 }
 
 int
-SMT_GetSmoothingReport(RPT_SmoothingReport *report, struct timeval *now)
+SMT_GetSmoothingReport(RPT_SmoothingReport *report, struct timespec *now)
 {
   double length, elapsed;
   int i;
@@ -327,7 +346,7 @@ SMT_GetSmoothingReport(RPT_SmoothingReport *report, struct timeval *now)
   report->freq_ppm *= -1.0e6;
   report->wander_ppm *= -1.0e6;
 
-  UTI_DiffTimevalsToDouble(&elapsed, now, &last_update);
+  elapsed = UTI_DiffTimespecsToDouble(now, &last_update);
   if (!locked && elapsed >= 0.0) {
     for (i = 0, length = 0.0; i < NUM_STAGES; i++)
       length += stages[i].length;

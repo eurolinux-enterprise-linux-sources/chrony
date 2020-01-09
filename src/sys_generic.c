@@ -2,7 +2,7 @@
   chronyd/chronyc - Programs for keeping computer clocks accurate.
 
  **********************************************************************
- * Copyright (C) Miroslav Lichvar  2014
+ * Copyright (C) Miroslav Lichvar  2014-2015
  * 
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -34,6 +34,7 @@
 #include "local.h"
 #include "localp.h"
 #include "logging.h"
+#include "privops.h"
 #include "sched.h"
 #include "util.h"
 
@@ -43,6 +44,8 @@
 static lcl_ReadFrequencyDriver drv_read_freq;
 static lcl_SetFrequencyDriver drv_set_freq;
 static lcl_SetSyncStatusDriver drv_set_sync_status;
+static lcl_AccrueOffsetDriver drv_accrue_offset;
+static lcl_OffsetCorrectionDriver drv_get_offset_correction;
 
 /* Current frequency as requested by the local module (in ppm) */
 static double base_freq;
@@ -68,15 +71,14 @@ static double offset_register;
 static double slew_freq;
 
 /* Time (raw) of last update of slewing frequency and offset */
-static struct timeval slew_start;
+static struct timespec slew_start;
 
 /* Limits for the slew timeout */
 #define MIN_SLEW_TIMEOUT 1.0
 #define MAX_SLEW_TIMEOUT 1.0e4
 
-/* Scheduler timeout ID and flag if the timer is currently running */
+/* Scheduler timeout ID for ending of the currently running slew */
 static SCH_TimeoutID slew_timeout_id;
-static int slew_timer_running;
 
 /* Suggested offset correction rate (correction time * offset) */
 static double correction_rate;
@@ -84,6 +86,16 @@ static double correction_rate;
 /* Maximum expected offset correction error caused by delayed change in the
    real frequency of the clock */
 static double slew_error;
+
+/* Minimum offset that the system driver can slew faster than the maximum
+   frequency offset that it allows to be set directly */
+static double fastslew_min_offset;
+
+/* Maximum slew rate of the system driver */
+static double fastslew_max_rate;
+
+/* Flag indicating that the system driver is currently slewing */
+static int fastslew_active;
 
 /* ================================================== */
 
@@ -94,7 +106,7 @@ static void update_slew(void);
 /* Adjust slew_start on clock step */
 
 static void
-handle_step(struct timeval *raw, struct timeval *cooked, double dfreq,
+handle_step(struct timespec *raw, struct timespec *cooked, double dfreq,
             double doffset, LCL_ChangeType change_type, void *anything)
 {
   if (change_type == LCL_ChangeUnknownStep) {
@@ -103,8 +115,40 @@ handle_step(struct timeval *raw, struct timeval *cooked, double dfreq,
     offset_register = 0.0;
     update_slew();
   } else if (change_type == LCL_ChangeStep) {
-    UTI_AddDoubleToTimeval(&slew_start, -doffset, &slew_start);
+    UTI_AddDoubleToTimespec(&slew_start, -doffset, &slew_start);
   }
+}
+
+/* ================================================== */
+
+static void
+start_fastslew(void)
+{
+  if (!drv_accrue_offset)
+    return;
+
+  drv_accrue_offset(offset_register, 0.0);
+
+  DEBUG_LOG(LOGF_SysGeneric, "fastslew offset=%e", offset_register);
+
+  offset_register = 0.0;
+  fastslew_active = 1;
+}
+
+/* ================================================== */
+
+static void
+stop_fastslew(struct timespec *now)
+{
+  double corr;
+
+  if (!drv_get_offset_correction || !fastslew_active)
+    return;
+
+  /* Cancel the remaining offset */
+  drv_get_offset_correction(now, &corr, NULL);
+  drv_accrue_offset(corr, 0.0);
+  offset_register -= corr;
 }
 
 /* ================================================== */
@@ -125,18 +169,19 @@ clamp_freq(double freq)
 static void
 update_slew(void)
 {
-  struct timeval now, end_of_slew;
+  struct timespec now, end_of_slew;
   double old_slew_freq, total_freq, corr_freq, duration;
 
   /* Remove currently running timeout */
-  if (slew_timer_running)
-    SCH_RemoveTimeout(slew_timeout_id);
+  SCH_RemoveTimeout(slew_timeout_id);
 
   LCL_ReadRawTime(&now);
 
   /* Adjust the offset register by achieved slew */
-  UTI_DiffTimevalsToDouble(&duration, &now, &slew_start);
+  duration = UTI_DiffTimespecsToDouble(&now, &slew_start);
   offset_register -= slew_freq * duration;
+
+  stop_fastslew(&now);
 
   /* Estimate how long should the next slew take */
   if (fabs(offset_register) < MIN_OFFSET_CORRECTION) {
@@ -154,6 +199,14 @@ update_slew(void)
     corr_freq = -max_corr_freq;
   else if (corr_freq > max_corr_freq)
     corr_freq = max_corr_freq;
+
+  /* Let the system driver perform the slew if the requested frequency
+     offset is too large for the frequency driver */
+  if (drv_accrue_offset && fabs(corr_freq) >= fastslew_max_rate &&
+      fabs(offset_register) > fastslew_min_offset) {
+    start_fastslew();
+    corr_freq = 0.0;
+  }
 
   /* Get the new real frequency and clamp it */
   total_freq = clamp_freq(base_freq + corr_freq * (1.0e6 - base_freq));
@@ -175,8 +228,8 @@ update_slew(void)
 
   /* Compute the duration of the slew and clamp it.  If the slewing frequency
      is zero or has wrong sign (e.g. due to rounding in the frequency driver or
-     when base_freq is larger than max_freq), use maximum timeout and try again
-     on the next update. */
+     when base_freq is larger than max_freq, or fast slew is active), use the
+     maximum timeout and try again on the next update. */
   if (fabs(offset_register) < MIN_OFFSET_CORRECTION ||
       offset_register * slew_freq <= 0.0) {
     duration = MAX_SLEW_TIMEOUT;
@@ -189,11 +242,9 @@ update_slew(void)
   }
 
   /* Restart timer for the next update */
-  UTI_AddDoubleToTimeval(&now, duration, &end_of_slew);
+  UTI_AddDoubleToTimespec(&now, duration, &end_of_slew);
   slew_timeout_id = SCH_AddTimeout(&end_of_slew, handle_end_of_slew, NULL);
-
   slew_start = now;
-  slew_timer_running = 1;
 
   DEBUG_LOG(LOGF_SysGeneric, "slew offset=%e corr_rate=%e base_freq=%f total_freq=%f slew_freq=%e duration=%f slew_error=%e",
       offset_register, correction_rate, base_freq, total_freq, slew_freq,
@@ -205,7 +256,7 @@ update_slew(void)
 static void
 handle_end_of_slew(void *anything)
 {
-  slew_timer_running = 0;
+  slew_timeout_id = 0;
   update_slew();
 }
 
@@ -243,16 +294,28 @@ accrue_offset(double offset, double corr_rate)
 /* Determine the correction to generate the cooked time for given raw time */
 
 static void
-offset_convert(struct timeval *raw,
+offset_convert(struct timespec *raw,
                double *corr, double *err)
 {
-  double duration;
+  double duration, fastslew_corr, fastslew_err;
 
-  UTI_DiffTimevalsToDouble(&duration, raw, &slew_start);
+  duration = UTI_DiffTimespecsToDouble(raw, &slew_start);
 
-  *corr = slew_freq * duration - offset_register;
-  if (err)
-    *err = fabs(duration) <= max_freq_change_delay ? slew_error : 0.0;
+  if (drv_get_offset_correction && fastslew_active) {
+    drv_get_offset_correction(raw, &fastslew_corr, &fastslew_err);
+    if (fastslew_corr == 0.0 && fastslew_err == 0.0)
+      fastslew_active = 0;
+  } else {
+    fastslew_corr = fastslew_err = 0.0;
+  }
+
+  *corr = slew_freq * duration + fastslew_corr - offset_register;
+
+  if (err) {
+    *err = fastslew_err;
+    if (fabs(duration) <= max_freq_change_delay)
+      *err += slew_error;
+  }
 }
 
 /* ================================================== */
@@ -261,19 +324,21 @@ offset_convert(struct timeval *raw,
 static int
 apply_step_offset(double offset)
 {
-  struct timeval old_time, new_time;
+  struct timespec old_time, new_time;
+  struct timeval new_time_tv;
   double err;
 
   LCL_ReadRawTime(&old_time);
-  UTI_AddDoubleToTimeval(&old_time, -offset, &new_time);
+  UTI_AddDoubleToTimespec(&old_time, -offset, &new_time);
+  UTI_TimespecToTimeval(&new_time, &new_time_tv);
 
-  if (settimeofday(&new_time, NULL) < 0) {
+  if (PRV_SetTime(&new_time_tv, NULL) < 0) {
     DEBUG_LOG(LOGF_SysGeneric, "settimeofday() failed");
     return 0;
   }
 
   LCL_ReadRawTime(&old_time);
-  UTI_DiffTimevalsToDouble(&err, &old_time, &new_time);
+  err = UTI_DiffTimespecsToDouble(&old_time, &new_time);
 
   lcl_InvokeDispersionNotifyHandlers(fabs(err));
 
@@ -303,6 +368,9 @@ SYS_Generic_CompleteFreqDriver(double max_set_freq_ppm, double max_set_freq_dela
                                lcl_ReadFrequencyDriver sys_read_freq,
                                lcl_SetFrequencyDriver sys_set_freq,
                                lcl_ApplyStepOffsetDriver sys_apply_step_offset,
+                               double min_fastslew_offset, double max_fastslew_rate,
+                               lcl_AccrueOffsetDriver sys_accrue_offset,
+                               lcl_OffsetCorrectionDriver sys_get_offset_correction,
                                lcl_SetLeapDriver sys_set_leap,
                                lcl_SetSyncStatusDriver sys_set_sync_status)
 {
@@ -310,6 +378,8 @@ SYS_Generic_CompleteFreqDriver(double max_set_freq_ppm, double max_set_freq_dela
   max_freq_change_delay = max_set_freq_delay * (1.0 + max_freq / 1.0e6);
   drv_read_freq = sys_read_freq;
   drv_set_freq = sys_set_freq;
+  drv_accrue_offset = sys_accrue_offset;
+  drv_get_offset_correction = sys_get_offset_correction;
   drv_set_sync_status = sys_set_sync_status;
 
   base_freq = (*drv_read_freq)();
@@ -317,6 +387,10 @@ SYS_Generic_CompleteFreqDriver(double max_set_freq_ppm, double max_set_freq_dela
   offset_register = 0.0;
 
   max_corr_freq = CNF_GetMaxSlewRate() / 1.0e6;
+
+  fastslew_min_offset = min_fastslew_offset;
+  fastslew_max_rate = max_fastslew_rate / 1.0e6;
+  fastslew_active = 0;
 
   lcl_RegisterSystemDrivers(read_frequency, set_frequency,
                             accrue_offset, sys_apply_step_offset ?
@@ -331,14 +405,18 @@ SYS_Generic_CompleteFreqDriver(double max_set_freq_ppm, double max_set_freq_dela
 void
 SYS_Generic_Finalise(void)
 {
+  struct timespec now;
+
   /* Must *NOT* leave a slew running - clock could drift way off
      if the daemon is not restarted */
-  if (slew_timer_running) {
-    SCH_RemoveTimeout(slew_timeout_id);
-    slew_timer_running = 0;
-  }
+
+  SCH_RemoveTimeout(slew_timeout_id);
+  slew_timeout_id = 0;
 
   (*drv_set_freq)(clamp_freq(base_freq));
+
+  LCL_ReadRawTime(&now);
+  stop_fastslew(&now);
 }
 
 /* ================================================== */

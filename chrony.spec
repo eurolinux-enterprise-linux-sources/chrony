@@ -4,7 +4,7 @@
 
 Name:           chrony
 Version:        2.1.1
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        An NTP client/server
 
 Group:          System Environment/Daemons
@@ -23,6 +23,8 @@ Source10:       https://github.com/mlichvar/clknetsim/archive/%{clknetsim_ver}/c
 Source11:       chrony-dnssrv@.service
 Source12:       chrony-dnssrv@.timer
 %{?gitpatch:Patch0: chrony-%{version}%{?prerelease}-%{gitpatch}.patch.gz}
+
+Patch1:         chrony-smoothleap.patch
 
 BuildRequires:  libcap-devel libedit-devel nss-devel pps-tools-devel
 BuildRequires:  bison texinfo systemd-units
@@ -47,6 +49,7 @@ clocks, system real-time clock or manual input as time references.
 %prep
 %setup -q -n %{name}-%{version}%{?prerelease} -a 10
 %{?gitpatch:%patch0 -p1}
+%patch1 -p1 -b .smoothleap
 
 %{?gitpatch: echo %{version}-%{gitpatch} > version.txt}
 
@@ -147,6 +150,9 @@ fi
 %dir %attr(-,chrony,chrony) %{_localstatedir}/log/chrony
 
 %changelog
+* Fri Nov 18 2016 Miroslav Lichvar <mlichvar@redhat.com> 2.1.1-4
+- fix crash with smoothtime leaponly directive (#1392793)
+
 * Tue Jun 28 2016 Miroslav Lichvar <mlichvar@redhat.com> 2.1.1-3
 - fix chrony-helper to exit with correct status (#1350531)
 

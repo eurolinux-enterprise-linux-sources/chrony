@@ -144,6 +144,7 @@ extern void REF_SetReference
  double offset,
  double offset_sd,
  double frequency,
+ double frequency_sd,
  double skew,
  double root_delay,
  double root_dispersion
@@ -183,6 +184,9 @@ extern void REF_DisableLocal(void);
 /* Check if current raw or cooked time is close to a leap second
    and is better to discard any measurements */
 extern int REF_IsLeapSecondClose(void);
+
+/* Return TAI-UTC offset corresponding to a time in UTC if available */
+extern int REF_GetTaiOffset(struct timespec *ts);
 
 extern void REF_GetTrackingReport(RPT_TrackingReport *rep);
 

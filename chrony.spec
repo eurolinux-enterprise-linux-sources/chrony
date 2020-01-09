@@ -1,10 +1,10 @@
 %global _hardened_build 1
-%global clknetsim_ver 71dbbc
+%global clknetsim_ver 8b4842
 %bcond_without debug
 
 Name:           chrony
-Version:        3.2
-Release:        2%{?dist}
+Version:        3.4
+Release:        1%{?dist}
 Summary:        An NTP client/server
 
 Group:          System Environment/Daemons
@@ -20,18 +20,18 @@ Source10:       https://github.com/mlichvar/clknetsim/archive/%{clknetsim_ver}/c
 
 # add NTP servers from DHCP when starting service
 Patch1:         chrony-service-helper.patch
-# enable support for SW/HW timestamping on older kernels
+# remove upstream kernel versions in documentation of HW timestamping
 Patch2:         chrony-timestamping.patch
-# revert upstream changes in packaged chrony.conf example
+# revert upstream changes in packaged configuration examples
 Patch3:         chrony-defconfig.patch
-# fix chronyc getting stuck in infinite loop after clock step
-Patch4:         chrony-select-timeout.patch
 
 BuildRequires:  libcap-devel libedit-devel nss-devel pps-tools-devel
 %ifarch %{ix86} x86_64 %{arm} aarch64 ppc64 ppc64le s390 s390x
 BuildRequires:  libseccomp-devel
 %endif
 BuildRequires:  bison systemd-units
+# require kernel headers with supported HW-timestamping features
+BuildRequires:  kernel-headers > 3.10.0-742
 
 Requires(pre):  shadow-utils
 Requires(post): systemd
@@ -54,7 +54,6 @@ clocks, system real-time clock or manual input as time references.
 %patch1 -p1 -b .service-helper
 %patch2 -p1 -b .timestamping
 %patch3 -p1 -b .defconfig
-%patch4 -p1 -b .select-timeout
 
 # review changes in packaged configuration files and scripts
 md5sum -c <<-EOF | (! grep -v 'OK$')
@@ -62,8 +61,8 @@ md5sum -c <<-EOF | (! grep -v 'OK$')
         58978d335ec3752ac2c38fa82b48f0a5  examples/chrony.conf.example2
         ba6bb05c50e03f6b5ab54a2b7914800d  examples/chrony.keys.example
         6a3178c4670de7de393d9365e2793740  examples/chrony.logrotate
-        27cbc940c94575de320dbd251cbb4514  examples/chrony.nm-dispatcher
-        a85246982a89910b1e2d3356b7d131d7  examples/chronyd.service
+        8748a663f0b1943ea491858f414a6b26  examples/chrony.nm-dispatcher
+        921b354e94f5e3db124cb50d11cd560f  examples/chronyd.service
 EOF
 
 # don't allow empty vendor zone
@@ -89,6 +88,7 @@ mv clknetsim-%{clknetsim_ver}* test/simulation/clknetsim
         --enable-ntp-signd \
         --enable-scfilter \
         --docdir=%{_docdir} \
+        --without-nettle \
         --with-ntp-era=$(date -d '1970-01-01 00:00:00+00:00' +'%s') \
         --with-user=chrony \
         --with-hwclockfile=%{_sysconfdir}/adjtime \
@@ -150,6 +150,16 @@ getent passwd chrony > /dev/null || /usr/sbin/useradd -r -g chrony \
 :
 
 %post
+# fix PIDFile in local chronyd.service on upgrades from chrony < 3.3-2
+if grep -q 'PIDFile=%{_localstatedir}/run/chronyd.pid' \
+                %{_sysconfdir}/systemd/system/chronyd.service 2> /dev/null && \
+        ! grep -qi '^[ '$'\t'']*pidfile' %{_sysconfdir}/chrony.conf 2> /dev/null
+then
+        sed -i '/PIDFile=/s|/run/|/run/chrony/|' \
+                %{_sysconfdir}/systemd/system/chronyd.service
+fi
+# workaround for late reload of unit file (#1614751)
+%{_bindir}/systemctl daemon-reload
 %systemd_post chronyd.service chrony-wait.service
 
 %preun
@@ -179,6 +189,10 @@ getent passwd chrony > /dev/null || /usr/sbin/useradd -r -g chrony \
 %dir %attr(-,chrony,chrony) %{_localstatedir}/log/chrony
 
 %changelog
+* Thu Jan 10 2019 Miroslav Lichvar <mlichvar@redhat.com> 3.4-1
+- update to 3.4 (#1636117, #1565544, #1565548, #1596239, #1600882)
+- drop support for HW timestamping on kernels < 3.10.0-613
+
 * Tue Dec 05 2017 Miroslav Lichvar <mlichvar@redhat.com> 3.2-2
 - fix chronyc getting stuck in infinite loop after clock step (#1520884)
 

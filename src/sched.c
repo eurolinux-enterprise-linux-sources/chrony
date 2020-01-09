@@ -219,13 +219,16 @@ SCH_RemoveFileHandler(int fd)
 /* ================================================== */
 
 void
-SCH_SetFileHandlerEvents(int fd, int events)
+SCH_SetFileHandlerEvent(int fd, int event, int enable)
 {
   FileHandlerEntry *ptr;
 
-  assert(events);
   ptr = ARR_GetElement(file_handlers, fd);
-  ptr->events = events;
+
+  if (enable)
+    ptr->events |= event;
+  else
+    ptr->events &= ~event;
 }
 
 /* ================================================== */
@@ -531,7 +534,8 @@ dispatch_filehandlers(int nfd, fd_set *read_fds, fd_set *write_fds, fd_set *exce
     if (except_fds && FD_ISSET(fd, except_fds)) {
       /* This descriptor has an exception, dispatch its handler */
       ptr = (FileHandlerEntry *)ARR_GetElement(file_handlers, fd);
-      (ptr->handler)(fd, SCH_FILE_EXCEPTION, ptr->arg);
+      if (ptr->handler)
+        (ptr->handler)(fd, SCH_FILE_EXCEPTION, ptr->arg);
       nfd--;
 
       /* Don't try to read from it now */
@@ -544,14 +548,16 @@ dispatch_filehandlers(int nfd, fd_set *read_fds, fd_set *write_fds, fd_set *exce
     if (read_fds && FD_ISSET(fd, read_fds)) {
       /* This descriptor can be read from, dispatch its handler */
       ptr = (FileHandlerEntry *)ARR_GetElement(file_handlers, fd);
-      (ptr->handler)(fd, SCH_FILE_INPUT, ptr->arg);
+      if (ptr->handler)
+        (ptr->handler)(fd, SCH_FILE_INPUT, ptr->arg);
       nfd--;
     }
 
     if (write_fds && FD_ISSET(fd, write_fds)) {
       /* This descriptor can be written to, dispatch its handler */
       ptr = (FileHandlerEntry *)ARR_GetElement(file_handlers, fd);
-      (ptr->handler)(fd, SCH_FILE_OUTPUT, ptr->arg);
+      if (ptr->handler)
+        (ptr->handler)(fd, SCH_FILE_OUTPUT, ptr->arg);
       nfd--;
     }
   }
